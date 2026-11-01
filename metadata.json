@@ -1,0 +1,6 @@
+{
+  "name": "Pixelo – Private Browser Image Tools",
+  "description": "Fast, private, browser-based image tools to compress, resize, crop, convert, and prepare photos for web and official forms without uploading files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
