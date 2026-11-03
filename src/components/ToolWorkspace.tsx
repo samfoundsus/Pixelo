@@ -218,9 +218,15 @@ function PreviewImageWithSkeleton({
   className?: string;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const imgRef = useRef<HTMLImageElement>(null);
 
   useEffect(() => {
-    setLoaded(false);
+    const img = imgRef.current;
+    if (img && img.complete && img.naturalWidth > 0) {
+      setLoaded(true);
+    } else {
+      setLoaded(false);
+    }
   }, [src]);
 
   return (
@@ -228,14 +234,16 @@ function PreviewImageWithSkeleton({
       {!loaded && (
         <Skeleton
           aria-hidden="true"
-          className="absolute inset-0 rounded-[10px]"
+          className="pointer-events-none absolute inset-0 rounded-[10px]"
         />
       )}
       <img
+        ref={imgRef}
         src={src}
         alt={alt}
         onLoad={() => setLoaded(true)}
-        className={className}
+        onError={() => setLoaded(true)}
+        className={`${className} relative z-10 opacity-100`}
       />
     </div>
   );
@@ -2268,7 +2276,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                             <img
                               src={item.thumbnailUrl}
                               alt={`Page ${idx + 1}`}
-                              className="h-[110px] w-full object-contain rounded-[8px] bg-white dark:bg-[#161616] p-[4px]"
+                              className="h-[110px] w-full object-contain opacity-100 rounded-[8px] bg-white dark:bg-[#161616] p-[4px]"
                             />
                           )}
                           <span className="mt-[6px] text-xs text-[#6B6B66] dark:text-[#9B9B95]">
@@ -2305,13 +2313,13 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                   <PreviewImageWithSkeleton
                     src={activeItem.result.url}
                     alt={`Processed preview for ${activeItem.name}`}
-                    className="max-h-[380px] max-w-full object-contain rounded-[8px]"
+                    className="max-h-[380px] max-w-full object-contain rounded-[8px] opacity-100"
                   />
                 ) : activeItem?.previewUrl ? (
                   <PreviewImageWithSkeleton
                     src={activeItem.previewUrl}
                     alt={`Preview for ${activeItem.name}`}
-                    className="max-h-[380px] max-w-full object-contain rounded-[8px] opacity-75"
+                    className="max-h-[380px] max-w-full object-contain rounded-[8px] opacity-100"
                   />
                 ) : null}
               </div>

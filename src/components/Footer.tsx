@@ -25,7 +25,7 @@ export function Footer({ onNavigate }: FooterProps) {
         blur="4px"
         className="max-w-[960px] mx-auto px-[20px] sm:px-[32px] py-[48px] sm:py-[72px] min-w-0"
       >
-        {/* Logo Area & Human Voice Tagline */}
+        {/* Logo Area */}
         <div className="pb-[32px] mb-[32px] border-b border-[#E7E5E0] dark:border-[#262624] flex flex-col sm:flex-row sm:items-baseline justify-between gap-[8px]">
           <a
             href="/"
@@ -34,9 +34,6 @@ export function Footer({ onNavigate }: FooterProps) {
           >
             {siteConfig.siteName}
           </a>
-          <p className="text-sm text-[#6B6B66] dark:text-[#9B9B95]">
-            Made in Bihar. Your photos never leave your phone.
-          </p>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-[24px] sm:gap-[32px] text-sm min-w-0">

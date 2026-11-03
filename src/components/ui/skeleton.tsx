@@ -8,7 +8,10 @@ export function Skeleton({
   return (
     <div
       data-slot="skeleton"
-      className={cn("skeleton-shimmer rounded-[10px]", className)}
+      className={cn(
+        "rounded-[10px] bg-[#EAE8E2] dark:bg-[#1E1E1C]",
+        className
+      )}
       {...props}
     />
   );

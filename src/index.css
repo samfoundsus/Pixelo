@@ -174,15 +174,6 @@
   }
 }
 
-@keyframes skeletonShimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
-}
-
 @keyframes accordionDown {
   from {
     height: 0;
@@ -237,25 +228,11 @@
 }
 
 .skeleton-shimmer {
-  background: linear-gradient(
-    90deg,
-    rgba(231, 229, 224, 0.35) 25%,
-    rgba(231, 229, 224, 0.8) 50%,
-    rgba(231, 229, 224, 0.35) 75%
-  );
-  background-size: 200% 100%;
-  animation: skeletonShimmer 1.6s ease-in-out infinite;
+  background-color: #EAE8E2;
 }
 
 .dark .skeleton-shimmer {
-  background: linear-gradient(
-    90deg,
-    rgba(38, 38, 36, 0.35) 25%,
-    rgba(38, 38, 36, 0.85) 50%,
-    rgba(38, 38, 36, 0.35) 75%
-  );
-  background-size: 200% 100%;
-  animation: skeletonShimmer 1.6s ease-in-out infinite;
+  background-color: #1E1E1C;
 }
 
 details > summary {

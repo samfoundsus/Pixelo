@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import { MoveHorizontal } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -29,6 +28,7 @@ export interface CompareProps {
  * - Responsive w-full, aspect-ratio from image dimensions, object-contain (never crops photos)
  * - Corner labels "Before" and "After"
  * - Keyboard accessible handle: focusable, ArrowLeft/ArrowRight move by 2% with aria-label and aria-valuenow
+ * - Zero shimmer/gradient/sweep overlays; static neutral placeholder unmounts immediately once images load
  */
 export const Compare = ({
   firstImage = "",
@@ -50,14 +50,26 @@ export const Compare = ({
   const [firstLoaded, setFirstLoaded] = useState(false);
   const [secondLoaded, setSecondLoaded] = useState(false);
   const sliderRef = useRef<HTMLDivElement>(null);
+  const firstImgRef = useRef<HTMLImageElement>(null);
+  const secondImgRef = useRef<HTMLImageElement>(null);
   const autoplayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    setFirstLoaded(false);
+    const img = firstImgRef.current;
+    if (img && img.complete && img.naturalWidth > 0) {
+      setFirstLoaded(true);
+    } else {
+      setFirstLoaded(false);
+    }
   }, [firstImage]);
 
   useEffect(() => {
-    setSecondLoaded(false);
+    const img = secondImgRef.current;
+    if (img && img.complete && img.naturalWidth > 0) {
+      setSecondLoaded(true);
+    } else {
+      setSecondLoaded(false);
+    }
   }, [secondImage]);
 
   const startAutoplay = useCallback(() => {
@@ -149,7 +161,8 @@ export const Compare = ({
     }
   }, []);
 
-  const isLoading = (!firstLoaded && !!firstImage) || (!secondLoaded && !!secondImage);
+  const isLoading =
+    (!firstLoaded && !!firstImage) || (!secondLoaded && !!secondImage);
 
   return (
     <div
@@ -161,7 +174,12 @@ export const Compare = ({
       style={{
         position: "relative",
         touchAction: "pan-y",
-        cursor: slideMode === "drag" ? (isDragging ? "grabbing" : "grab") : "col-resize",
+        cursor:
+          slideMode === "drag"
+            ? isDragging
+              ? "grabbing"
+              : "grab"
+            : "col-resize",
         aspectRatio: aspectRatio ? `${aspectRatio}` : undefined,
       }}
       className={cn(
@@ -169,11 +187,11 @@ export const Compare = ({
         className
       )}
     >
-      {/* Skeleton shimmer while either blob URL is still decoding */}
+      {/* Static neutral block only while images are still loading; unmounted immediately on load */}
       {isLoading && (
         <div
           aria-hidden="true"
-          className="skeleton-shimmer absolute inset-0 z-30 rounded-[10px]"
+          className="pointer-events-none absolute inset-0 z-10 rounded-[10px] bg-[#EAE8E2] dark:bg-[#1E1E1C]"
         />
       )}
 
@@ -186,81 +204,77 @@ export const Compare = ({
       </span>
 
       {/* 1.5px Vermilion Divider Line & 44px Hit Area Focusable Keyboard-Accessible Handle */}
-      <AnimatePresence initial={false}>
-        <motion.div
-          className="absolute top-0 bottom-0 z-40 w-[1.5px] -translate-x-1/2 bg-[#E5542B]"
-          style={{
-            left: `${sliderXPercent}%`,
-          }}
-          transition={{ duration: 0 }}
-        >
-          {showHandlebar && (
-            <div
-              role="slider"
-              tabIndex={0}
-              aria-label="Compare before and after image"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={Math.round(sliderXPercent)}
-              onKeyDown={handleKeyDown}
-              style={{ touchAction: "pan-y" }}
-              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-40 flex h-[44px] w-[44px] items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[#E5542B] focus-visible:outline-offset-2"
-            >
-              <span className="flex h-[32px] w-[32px] items-center justify-center rounded-full border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA] shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition-transform duration-150 hover:scale-105">
-                <MoveHorizontal
-                  strokeWidth={1.5}
-                  className="h-[15px] w-[15px] text-[#1A1A1A] dark:text-[#EDEDEA]"
-                />
-              </span>
-            </div>
-          )}
-        </motion.div>
-      </AnimatePresence>
+      <div
+        className="absolute top-0 bottom-0 z-40 w-[1.5px] -translate-x-1/2 bg-[#E5542B]"
+        style={{
+          left: `${sliderXPercent}%`,
+        }}
+      >
+        {showHandlebar && (
+          <div
+            role="slider"
+            tabIndex={0}
+            aria-label="Compare before and after image"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(sliderXPercent)}
+            onKeyDown={handleKeyDown}
+            style={{ touchAction: "pan-y" }}
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-40 flex h-[44px] w-[44px] items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[#E5542B] focus-visible:outline-offset-2"
+          >
+            <span className="flex h-[32px] w-[32px] items-center justify-center rounded-full border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA] shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition-transform duration-150 hover:scale-105">
+              <MoveHorizontal
+                strokeWidth={1.5}
+                className="h-[15px] w-[15px] text-[#1A1A1A] dark:text-[#EDEDEA]"
+              />
+            </span>
+          </div>
+        )}
+      </div>
 
       {/* First Image (Before / Original, clipped by sliderXPercent) */}
       <div className="pointer-events-none relative z-20 h-full w-full overflow-hidden">
-        <AnimatePresence initial={false}>
-          {firstImage ? (
-            <motion.div
+        {firstImage ? (
+          <div
+            className={cn(
+              "absolute inset-0 z-20 h-full w-full shrink-0 select-none overflow-hidden",
+              firstImageClassName
+            )}
+            style={{
+              clipPath: `inset(0 ${100 - sliderXPercent}% 0 0)`,
+            }}
+          >
+            <img
+              ref={firstImgRef}
+              alt={firstLabel}
+              src={firstImage}
+              onLoad={() => setFirstLoaded(true)}
+              onError={() => setFirstLoaded(true)}
               className={cn(
-                "absolute inset-0 z-20 h-full w-full shrink-0 select-none overflow-hidden",
+                "absolute inset-0 z-20 h-full w-full shrink-0 object-contain opacity-100 select-none",
                 firstImageClassName
               )}
-              style={{
-                clipPath: `inset(0 ${100 - sliderXPercent}% 0 0)`,
-              }}
-              transition={{ duration: 0 }}
-            >
-              <img
-                alt={firstLabel}
-                src={firstImage}
-                onLoad={() => setFirstLoaded(true)}
-                className={cn(
-                  "absolute inset-0 z-20 h-full w-full shrink-0 object-contain select-none",
-                  firstImageClassName
-                )}
-                draggable={false}
-              />
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
+              draggable={false}
+            />
+          </div>
+        ) : null}
       </div>
 
       {/* Second Image (After / Processed full layer underneath) */}
-      <AnimatePresence initial={false}>
-        {secondImage ? (
-          <motion.img
-            className={cn(
-              "pointer-events-none absolute inset-0 z-[19] h-full w-full object-contain select-none",
-              secondImageClassname
-            )}
-            alt={secondLabel}
-            src={secondImage}
-            onLoad={() => setSecondLoaded(true)}
-            draggable={false}
-          />
-        ) : null}
-      </AnimatePresence>
+      {secondImage ? (
+        <img
+          ref={secondImgRef}
+          className={cn(
+            "pointer-events-none absolute inset-0 z-[19] h-full w-full object-contain opacity-100 select-none",
+            secondImageClassname
+          )}
+          alt={secondLabel}
+          src={secondImage}
+          onLoad={() => setSecondLoaded(true)}
+          onError={() => setSecondLoaded(true)}
+          draggable={false}
+        />
+      ) : null}
     </div>
   );
 };

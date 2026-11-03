@@ -209,7 +209,7 @@ export function HomePage({ onNavigate, onOpenCommandPalette }: HomePageProps) {
                 {showDemoCompare ? (
                   <Suspense
                     fallback={
-                      <div className="skeleton-shimmer w-full aspect-[16/11] rounded-[10px]" />
+                      <div className="w-full aspect-[16/11] rounded-[10px] bg-[#EAE8E2] dark:bg-[#1E1E1C]" />
                     }
                   >
                     <LazyCompare

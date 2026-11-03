@@ -9,7 +9,6 @@ import {
   Stamp,
   Contrast,
   ArrowLeftRight,
-  ChevronDown,
   Sun,
   Moon,
   Menu,
@@ -19,19 +18,6 @@ import {
 import { siteConfig } from '../../config/site';
 import { TOOLS_DATA, TOOL_CATEGORIES, ToolId } from '../data/tools';
 import { BlurFade } from './ui/blur-fade';
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from './ui/sheet';
-import {
-  TooltipProvider,
-  Tooltip,
-  TooltipTrigger,
-  TooltipContent,
-} from './ui/tooltip';
 
 interface HeaderProps {
   currentPath: string;
@@ -171,6 +157,14 @@ export function useScrollReveal(depKey?: string) {
   return containerRef;
 }
 
+const SITE_MENU_LINKS = [
+  { label: 'Blog', path: '/blog' },
+  { label: 'About', path: '/about' },
+  { label: 'Contact', path: '/contact' },
+  { label: 'Privacy', path: '/privacy' },
+  { label: 'Terms', path: '/terms' },
+] as const;
+
 export function Header({
   currentPath,
   onNavigate,
@@ -180,9 +174,12 @@ export function Header({
 }: HeaderProps) {
   const [localDark, setLocalDark] = useState(false);
   const [scrolled, setScrolled] = useState(false);
-  const [desktopMenuOpen, setDesktopMenuOpen] = useState(false);
-  const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
-  const desktopMenuRef = useRef<HTMLDivElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const wasOpenRef = useRef(false);
 
   const isDark = theme ? theme === 'dark' : localDark;
 
@@ -200,35 +197,64 @@ export function Header({
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  // Close menus on route change
+  // Close menu on route change
   useEffect(() => {
-    setDesktopMenuOpen(false);
-    setMobileSheetOpen(false);
+    setMenuOpen(false);
   }, [currentPath]);
 
+  // Prevent background scroll, manage focus trap, Escape key, and focus restoration
   useEffect(() => {
-    if (!desktopMenuOpen) return;
-    const onDocClick = (e: MouseEvent) => {
-      if (
-        desktopMenuOpen &&
-        desktopMenuRef.current &&
-        !desktopMenuRef.current.contains(e.target as Node)
-      ) {
-        setDesktopMenuOpen(false);
+    if (typeof document === 'undefined') return;
+
+    if (menuOpen) {
+      wasOpenRef.current = true;
+      document.body.style.overflow = 'hidden';
+
+      const focusTimer = window.setTimeout(() => {
+        closeButtonRef.current?.focus();
+      }, 20);
+
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setMenuOpen(false);
+          return;
+        }
+
+        if (e.key === 'Tab' && panelRef.current) {
+          const focusable = Array.from(
+            panelRef.current.querySelectorAll<HTMLElement>(
+              'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+            )
+          );
+          if (focusable.length === 0) return;
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+
+          if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      };
+
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        window.clearTimeout(focusTimer);
+        document.removeEventListener('keydown', handleKeyDown);
+        document.body.style.overflow = '';
+      };
+    } else {
+      document.body.style.overflow = '';
+      if (wasOpenRef.current) {
+        wasOpenRef.current = false;
+        menuButtonRef.current?.focus();
       }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setDesktopMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onDocClick);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocClick);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [desktopMenuOpen]);
+    }
+  }, [menuOpen]);
 
   const toggleTheme = () => {
     if (onToggleTheme) {
@@ -253,13 +279,14 @@ export function Header({
   const handleLinkClick = (e: React.MouseEvent<HTMLAnchorElement>, path: string) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
     e.preventDefault();
-    setDesktopMenuOpen(false);
-    setMobileSheetOpen(false);
+    setMenuOpen(false);
     onNavigate(path);
   };
 
+  let staggerCounter = 0;
+
   return (
-    <TooltipProvider delayDuration={200}>
+    <>
       <header
         className={`sticky top-0 z-40 backdrop-blur-md bg-[#F7F6F3]/90 dark:bg-[#0E0E0E]/90 border-b transition-colors duration-200 ${
           scrolled
@@ -267,8 +294,8 @@ export function Header({
             : 'border-transparent'
         }`}
       >
-        <div className="max-w-[960px] mx-auto h-[64px] px-[20px] sm:px-[32px] flex items-center justify-between gap-[12px] sm:gap-[16px] min-w-0">
-          {/* Wordmark Logo Left */}
+        <div className="max-w-[960px] mx-auto h-[64px] px-[20px] sm:px-[32px] flex items-center justify-between gap-[12px] min-w-0">
+          {/* Left: Pixelo wordmark with accent dot */}
           <a
             href="/"
             onClick={(e) => handleLinkClick(e, '/')}
@@ -281,165 +308,30 @@ export function Header({
             />
           </a>
 
-          {/* Desktop Navigation (>= 640px) */}
-          <div className="hidden sm:flex items-center gap-[16px] min-w-0">
-            <nav
-              aria-label="Main Navigation"
-              className="flex items-center gap-[18px] text-sm text-[#6B6B66] dark:text-[#9B9B95] min-w-0"
-            >
-              {/* Tools Dropdown Trigger + Direct Link */}
-              <div ref={desktopMenuRef} className="relative">
-                <div className="flex items-center gap-[2px]">
-                  <a
-                    href="/tools"
-                    onClick={(e) => handleLinkClick(e, '/tools')}
-                    className={`min-h-[48px] inline-flex items-center px-[4px] link-draw hover:text-[#1A1A1A] dark:hover:text-[#EDEDEA] whitespace-nowrap ${
-                      currentPath === '/tools' ? 'text-[#1A1A1A] dark:text-[#EDEDEA] font-medium' : ''
-                    }`}
-                  >
-                    Tools
-                  </a>
-                  <button
-                    type="button"
-                    onClick={() => setDesktopMenuOpen((o) => !o)}
-                    aria-expanded={desktopMenuOpen}
-                    aria-label="Toggle tools quick menu"
-                    className="min-h-[48px] min-w-[32px] inline-flex items-center justify-center text-[#6B6B66] dark:text-[#9B9B95] hover:text-[#E5542B] dark:hover:text-[#E5542B] transition-colors duration-150 cursor-pointer"
-                  >
-                    <ChevronDown
-                      strokeWidth={1.5}
-                      className={`w-[15px] h-[15px] transition-transform duration-150 ${
-                        desktopMenuOpen ? 'rotate-180 text-[#E5542B]' : ''
-                      }`}
-                    />
-                  </button>
-                </div>
-
-                {desktopMenuOpen && (
-                  <div
-                    role="menu"
-                    className="animate-menu-open absolute right-0 sm:left-0 sm:right-auto mt-[8px] w-[520px] max-w-[calc(100vw-40px)] rounded-[14px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] p-[16px] shadow-sm z-50"
-                  >
-                    <div className="grid grid-cols-2 gap-[16px] max-h-[72dvh] overflow-y-auto">
-                      {TOOL_CATEGORIES.map((cat) => (
-                        <div key={cat.name} className="space-y-[6px] min-w-0">
-                          <div className="px-[10px] text-[11px] font-medium uppercase tracking-wider text-[#6B6B66] dark:text-[#9B9B95]">
-                            {cat.name}
-                          </div>
-                          <div className="space-y-[2px]">
-                            {TOOLS_DATA.filter((t) => t.category === cat.name).map((tool, idx) => (
-                              <a
-                                key={tool.slug}
-                                href={tool.path}
-                                role="menuitem"
-                                onClick={(e) => handleLinkClick(e, tool.path)}
-                                style={{ animationDelay: `${idx * 15}ms` }}
-                                className="animate-menu-item group min-h-[44px] flex items-center justify-between gap-[8px] px-[10px] py-[8px] rounded-[8px] hover:bg-[#F7F6F3] dark:hover:bg-[#0E0E0E] text-sm text-[#1A1A1A] dark:text-[#EDEDEA] transition-colors duration-150 min-w-0"
-                              >
-                                <span className="flex items-center gap-[8px] min-w-0 truncate">
-                                  <ToolGlyph slug={tool.slug} />
-                                  <span className="truncate">{tool.name}</span>
-                                </span>
-                                <span
-                                  aria-hidden="true"
-                                  className="text-xs text-[#6B6B66] dark:text-[#9B9B95] group-hover:text-[#E5542B] group-hover:translate-x-[3px] transition-all duration-150 shrink-0"
-                                >
-                                  →
-                                </span>
-                              </a>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <a
-                href="/blog"
-                onClick={(e) => handleLinkClick(e, '/blog')}
-                className={`min-h-[48px] inline-flex items-center px-[4px] link-draw hover:text-[#1A1A1A] dark:hover:text-[#EDEDEA] whitespace-nowrap ${
-                  currentPath.startsWith('/blog') ? 'text-[#1A1A1A] dark:text-[#EDEDEA] font-medium' : ''
-                }`}
-              >
-                Blog
-              </a>
-              <a
-                href="/about"
-                onClick={(e) => handleLinkClick(e, '/about')}
-                className={`min-h-[48px] inline-flex items-center px-[4px] link-draw hover:text-[#1A1A1A] dark:hover:text-[#EDEDEA] whitespace-nowrap ${
-                  currentPath === '/about' ? 'text-[#1A1A1A] dark:text-[#EDEDEA] font-medium' : ''
-                }`}
-              >
-                About
-              </a>
-            </nav>
-
-            {/* Command Search Button (Desktop) */}
-            {onOpenCommandPalette && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={onOpenCommandPalette}
-                    aria-label="Search tools (Command+K)"
-                    className="btn-press min-h-[38px] px-[12px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-xs text-[#6B6B66] dark:text-[#9B9B95] hover:border-[#E5542B] hover:text-[#1A1A1A] dark:hover:text-[#EDEDEA] inline-flex items-center gap-[8px] transition-colors duration-150 cursor-pointer shrink-0"
-                  >
-                    <Search strokeWidth={1.5} className="w-[14px] h-[14px] shrink-0" />
-                    <span>Search tools...</span>
-                    <kbd className="ml-[2px] px-[5px] py-[1px] rounded-[5px] border border-[#E7E5E0] dark:border-[#262624] bg-[#F7F6F3] dark:bg-[#0E0E0E] font-mono text-[10px] text-[#6B6B66] dark:text-[#9B9B95]">
-                      ⌘K
-                    </kbd>
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>Jump to any tool (⌘K / Ctrl+K)</TooltipContent>
-              </Tooltip>
-            )}
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={toggleTheme}
-                  aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-                  className="btn-press min-h-[48px] min-w-[48px] inline-flex items-center justify-center rounded-[10px] text-[#6B6B66] hover:text-[#E5542B] dark:text-[#9B9B95] dark:hover:text-[#E5542B] cursor-pointer shrink-0"
-                >
-                  {isDark ? (
-                    <Sun strokeWidth={1.5} className="w-[18px] h-[18px] transition-transform duration-250" />
-                  ) : (
-                    <Moon strokeWidth={1.5} className="w-[18px] h-[18px] transition-transform duration-250" />
-                  )}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-              </TooltipContent>
-            </Tooltip>
-          </div>
-
-          {/* Mobile Search + Menu Buttons Right (< 640px) */}
-          <div className="flex sm:hidden items-center gap-[8px]">
+          {/* Right: Search icon button, Menu button with hamburger icon, and Theme toggle (all screen widths) */}
+          <div className="flex items-center gap-[8px] shrink-0">
             {onOpenCommandPalette && (
               <button
                 type="button"
                 onClick={onOpenCommandPalette}
-                aria-label="Search tools"
-                className="btn-press min-h-[48px] min-w-[48px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center justify-center cursor-pointer"
+                aria-label="Search tools (Command+K)"
+                title="Search tools (⌘K / Ctrl+K)"
+                className="btn-press min-h-[48px] min-w-[48px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA] hover:border-[#E5542B] dark:hover:border-[#E5542B] hover:text-[#E5542B] dark:hover:text-[#E5542B] inline-flex items-center justify-center transition-colors duration-150 cursor-pointer shrink-0"
               >
                 <Search strokeWidth={1.5} className="w-[18px] h-[18px]" />
               </button>
             )}
 
             <button
+              ref={menuButtonRef}
               type="button"
-              onClick={() => setMobileSheetOpen((open) => !open)}
-              aria-expanded={mobileSheetOpen}
-              aria-controls="mobile-navigation-sheet"
-              aria-label={mobileSheetOpen ? 'Close menu' : 'Open menu'}
-              className="btn-press min-h-[48px] px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-sm font-medium text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center gap-[8px] cursor-pointer"
+              onClick={() => setMenuOpen((open) => !open)}
+              aria-expanded={menuOpen}
+              aria-controls="site-navigation-panel"
+              aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+              className="btn-press min-h-[48px] px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] dark:hover:border-[#E5542B] text-sm font-medium text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center gap-[8px] transition-colors duration-150 cursor-pointer shrink-0"
             >
-              {mobileSheetOpen ? (
+              {menuOpen ? (
                 <>
                   <X strokeWidth={1.5} className="w-[18px] h-[18px]" />
                   <span>Close</span>
@@ -451,150 +343,186 @@ export function Header({
                 </>
               )}
             </button>
+
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+              className="btn-press min-h-[48px] min-w-[48px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] dark:hover:border-[#E5542B] text-[#6B6B66] hover:text-[#E5542B] dark:text-[#9B9B95] dark:hover:text-[#E5542B] inline-flex items-center justify-center transition-colors duration-150 cursor-pointer shrink-0"
+            >
+              {isDark ? (
+                <Sun strokeWidth={1.5} className="w-[18px] h-[18px] transition-transform duration-250" />
+              ) : (
+                <Moon strokeWidth={1.5} className="w-[18px] h-[18px] transition-transform duration-250" />
+              )}
+            </button>
           </div>
         </div>
+      </header>
 
-        {/* Mobile Menu Sheet using shadcn Sheet on Radix Dialog (100dvh, closes on route change) */}
-        <Sheet open={mobileSheetOpen} onOpenChange={setMobileSheetOpen}>
-          <SheetContent
-            id="mobile-navigation-sheet"
-            aria-label="Site navigation menu"
-            style={{
-              paddingBottom: 'calc(24px + env(safe-area-inset-bottom, 0px))',
-            }}
-            className="sm:hidden px-[20px] pt-[16px]"
-          >
-            <SheetHeader className="sr-only">
-              <SheetTitle>Site navigation menu</SheetTitle>
-              <SheetDescription>
-                Browse all 14 private image tools, guides, and appearance settings.
-              </SheetDescription>
-            </SheetHeader>
+      {/* SEO-safe Navigation Sheet / Right-Side Panel: always rendered in DOM, hidden when closed */}
+      <div
+        id="site-navigation-panel"
+        role="dialog"
+        aria-modal={menuOpen ? 'true' : undefined}
+        aria-label="Site navigation menu"
+        aria-hidden={!menuOpen}
+        inert={!menuOpen ? true : undefined}
+        className={`fixed inset-0 z-50 transition-opacity duration-150 motion-reduce:transition-none ${
+          menuOpen
+            ? 'visible pointer-events-auto opacity-100'
+            : 'invisible pointer-events-none opacity-0'
+        }`}
+      >
+        {/* Soft Backdrop */}
+        <div
+          aria-hidden="true"
+          onClick={() => setMenuOpen(false)}
+          className="fixed inset-0 bg-black/45 backdrop-blur-[2px]"
+        />
 
-            <div className="space-y-[24px] max-w-[680px] mx-auto min-w-0">
-              <div className="flex items-center justify-between pb-[12px] border-b border-[#E7E5E0] dark:border-[#262624]">
-                <span className="font-serif-heading text-2xl text-[#1A1A1A] dark:text-[#EDEDEA]">
-                  {siteConfig.siteName}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileSheetOpen(false)}
-                  aria-label="Close navigation menu"
-                  className="btn-press min-h-[48px] px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-sm font-medium text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center gap-[6px] cursor-pointer"
-                >
-                  <X strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                  <span>Close</span>
-                </button>
-              </div>
+        {/* Full-height sheet on mobile (< 640px), 420px right-side panel on desktop (>= 640px) */}
+        <div
+          ref={panelRef}
+          style={{
+            paddingBottom: 'calc(28px + env(safe-area-inset-bottom, 0px))',
+          }}
+          className={`fixed inset-y-0 right-0 z-10 h-dvh w-full sm:w-[420px] max-w-full overflow-y-auto bg-[#F7F6F3] dark:bg-[#0E0E0E] sm:border-l border-[#E7E5E0] dark:border-[#262624] px-[20px] sm:px-[24px] pt-[12px] shadow-xl transition-all duration-150 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none motion-reduce:transform-none ${
+            menuOpen ? 'translate-x-0 opacity-100' : 'translate-x-[8px] opacity-0'
+          }`}
+        >
+          {/* Panel Header */}
+          <div className="flex items-center justify-between gap-[12px] pb-[12px] border-b border-[#E7E5E0] dark:border-[#262624]">
+            <a
+              href="/"
+              onClick={(e) => handleLinkClick(e, '/')}
+              tabIndex={menuOpen ? 0 : -1}
+              className="min-h-[48px] inline-flex items-center gap-[6px] font-serif-heading text-2xl tracking-tight text-[#1A1A1A] dark:text-[#EDEDEA] hover:text-[#E5542B] transition-colors duration-150"
+            >
+              <span>{siteConfig.siteName}</span>
+              <span
+                aria-hidden="true"
+                className="inline-block w-[5px] h-[5px] rounded-full bg-[#E5542B] translate-y-[3px]"
+              />
+            </a>
 
-              {/* Primary Links + Search + Theme Toggle */}
-              <nav aria-label="Mobile Primary Links" className="space-y-[8px]">
-                {onOpenCommandPalette && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMobileSheetOpen(false);
-                      onOpenCommandPalette();
-                    }}
-                    className="btn-press min-h-[48px] w-full px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] flex items-center justify-between text-[16px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA] cursor-pointer"
-                  >
-                    <span className="flex items-center gap-[10px]">
-                      <Search strokeWidth={1.5} className="w-[16px] h-[16px] text-[#E5542B]" />
-                      <span>Search tools...</span>
-                    </span>
-                    <span className="text-xs font-mono text-[#6B6B66] dark:text-[#9B9B95]">
-                      Quick jump
-                    </span>
-                  </button>
-                )}
+            <div className="flex items-center gap-[10px]">
+              <span className="hidden sm:inline-flex items-center px-[8px] py-[3px] rounded-[6px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] font-mono text-[11px] text-[#6B6B66] dark:text-[#9B9B95]">
+                Esc to close
+              </span>
+              <button
+                ref={closeButtonRef}
+                type="button"
+                onClick={() => setMenuOpen(false)}
+                tabIndex={menuOpen ? 0 : -1}
+                aria-label="Close menu"
+                className="btn-press min-h-[48px] px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] dark:hover:border-[#E5542B] text-sm font-medium text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center gap-[6px] cursor-pointer"
+              >
+                <X strokeWidth={1.5} className="w-[16px] h-[16px]" />
+                <span>Close</span>
+              </button>
+            </div>
+          </div>
 
-                <a
-                  href="/tools"
-                  onClick={(e) => handleLinkClick(e, '/tools')}
-                  className="min-h-[48px] w-full px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] flex items-center justify-between text-[17px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA]"
-                >
-                  <span>All Tools</span>
-                  <span aria-hidden="true" className="text-[#6B6B66] dark:text-[#9B9B95]">
-                    →
-                  </span>
-                </a>
-                <a
-                  href="/blog"
-                  onClick={(e) => handleLinkClick(e, '/blog')}
-                  className="min-h-[48px] w-full px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] flex items-center justify-between text-[17px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA]"
-                >
-                  <span>Blog & Guides</span>
-                  <span aria-hidden="true" className="text-[#6B6B66] dark:text-[#9B9B95]">
-                    →
-                  </span>
-                </a>
-                <a
-                  href="/about"
-                  onClick={(e) => handleLinkClick(e, '/about')}
-                  className="min-h-[48px] w-full px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] flex items-center justify-between text-[17px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA]"
-                >
-                  <span>About</span>
-                  <span aria-hidden="true" className="text-[#6B6B66] dark:text-[#9B9B95]">
-                    →
-                  </span>
-                </a>
-
-                <button
-                  type="button"
-                  onClick={toggleTheme}
-                  className="btn-press min-h-[48px] w-full px-[14px] rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] flex items-center justify-between text-[16px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA] cursor-pointer"
-                >
-                  <span>Appearance: {isDark ? 'Dark mode' : 'Light mode'}</span>
-                  {isDark ? (
-                    <Sun strokeWidth={1.5} className="w-[18px] h-[18px] text-[#E5542B]" />
-                  ) : (
-                    <Moon strokeWidth={1.5} className="w-[18px] h-[18px] text-[#6B6B66]" />
-                  )}
-                </button>
-              </nav>
-
-              {/* Tools Grouped by Purpose inside the Sheet */}
-              <div className="space-y-[20px] pt-[8px] border-t border-[#E7E5E0] dark:border-[#262624]">
-                {TOOL_CATEGORIES.map((category) => {
-                  const catTools = TOOLS_DATA.filter((t) => t.category === category.name);
-                  return (
-                    <div key={category.name} className="space-y-[8px] min-w-0">
-                      <div className="px-[4px] text-xs font-medium uppercase tracking-wider text-[#6B6B66] dark:text-[#9B9B95]">
-                        {category.name}
-                      </div>
-                      <div className="grid grid-cols-1 gap-[6px]">
-                        {catTools.map((tool) => (
-                          <a
-                            key={tool.slug}
-                            href={tool.path}
-                            onClick={(e) => handleLinkClick(e, tool.path)}
-                            className={`group min-h-[48px] w-full px-[14px] rounded-[10px] border flex items-center justify-between gap-[10px] text-[16px] transition-colors duration-150 min-w-0 ${
-                              currentPath === tool.path
-                                ? 'border-[#E5542B] bg-white dark:bg-[#161616] font-medium text-[#1A1A1A] dark:text-[#EDEDEA]'
-                                : 'border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA]'
-                            }`}
-                          >
-                            <span className="flex items-center gap-[10px] min-w-0 truncate">
+          {/* Main Navigation: Tools Grouped by Purpose (Compress, Convert, Edit, Documents) + Site Links */}
+          <nav aria-label="Main Navigation" className="mt-[20px] space-y-[24px] min-w-0">
+            {TOOL_CATEGORIES.map((category) => {
+              const catTools = TOOLS_DATA.filter((t) => t.category === category.name);
+              return (
+                <div key={category.name} className="space-y-[8px] min-w-0">
+                  <div className="px-[4px] text-[11px] font-medium uppercase tracking-wider text-[#6B6B66] dark:text-[#9B9B95]">
+                    {category.name}
+                  </div>
+                  <div className="grid grid-cols-1 gap-[6px]">
+                    {catTools.map((tool) => {
+                      const delayMs = staggerCounter * 20;
+                      staggerCounter += 1;
+                      return (
+                        <a
+                          key={tool.slug}
+                          href={tool.path}
+                          tabIndex={menuOpen ? 0 : -1}
+                          onClick={(e) => handleLinkClick(e, tool.path)}
+                          style={menuOpen ? { animationDelay: `${delayMs}ms` } : undefined}
+                          className={`group min-h-[56px] w-full px-[14px] py-[10px] rounded-[10px] border flex items-center justify-between gap-[10px] transition-colors duration-150 min-w-0 ${
+                            menuOpen ? 'animate-menu-item' : ''
+                          } ${
+                            currentPath === tool.path
+                              ? 'border-[#E5542B] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA]'
+                              : 'border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] dark:hover:border-[#E5542B] text-[#1A1A1A] dark:text-[#EDEDEA]'
+                          }`}
+                        >
+                          <div className="flex items-start gap-[10px] min-w-0 flex-1">
+                            <span className="mt-[3px] shrink-0">
                               <ToolGlyph slug={tool.slug} />
-                              <span className="truncate">{tool.name}</span>
                             </span>
-                            <span
-                              aria-hidden="true"
-                              className="text-sm text-[#6B6B66] dark:text-[#9B9B95] shrink-0"
-                            >
-                              →
-                            </span>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="text-[15px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                                {tool.name}
+                              </div>
+                              <div className="text-[12px] text-[#6B6B66] dark:text-[#9B9B95] truncate">
+                                {tool.shortDescription}
+                              </div>
+                            </div>
+                          </div>
+                          <span
+                            aria-hidden="true"
+                            className="text-sm text-[#6B6B66] dark:text-[#9B9B95] group-hover:text-[#E5542B] group-hover:translate-x-[3px] transition-all duration-150 shrink-0"
+                          >
+                            →
+                          </span>
+                        </a>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Site Pages: Blog, About, Contact, Privacy, Terms */}
+            <div className="pt-[16px] border-t border-[#E7E5E0] dark:border-[#262624] space-y-[8px] min-w-0">
+              <div className="px-[4px] text-[11px] font-medium uppercase tracking-wider text-[#6B6B66] dark:text-[#9B9B95]">
+                Pages & Legal
+              </div>
+              <div className="grid grid-cols-1 gap-[6px]">
+                {SITE_MENU_LINKS.map((link) => {
+                  const delayMs = staggerCounter * 20;
+                  staggerCounter += 1;
+                  const isActive =
+                    link.path === '/blog'
+                      ? currentPath.startsWith('/blog')
+                      : currentPath === link.path;
+                  return (
+                    <a
+                      key={link.path}
+                      href={link.path}
+                      tabIndex={menuOpen ? 0 : -1}
+                      onClick={(e) => handleLinkClick(e, link.path)}
+                      style={menuOpen ? { animationDelay: `${delayMs}ms` } : undefined}
+                      className={`group min-h-[48px] w-full px-[14px] rounded-[10px] border flex items-center justify-between text-[15px] font-medium transition-colors duration-150 ${
+                        menuOpen ? 'animate-menu-item' : ''
+                      } ${
+                        isActive
+                          ? 'border-[#E5542B] bg-white dark:bg-[#161616] text-[#1A1A1A] dark:text-[#EDEDEA]'
+                          : 'border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] dark:hover:border-[#E5542B] text-[#1A1A1A] dark:text-[#EDEDEA]'
+                      }`}
+                    >
+                      <span>{link.label}</span>
+                      <span
+                        aria-hidden="true"
+                        className="text-sm text-[#6B6B66] dark:text-[#9B9B95] group-hover:text-[#E5542B] group-hover:translate-x-[3px] transition-all duration-150"
+                      >
+                        →
+                      </span>
+                    </a>
                   );
                 })}
               </div>
             </div>
-          </SheetContent>
-        </Sheet>
-      </header>
-    </TooltipProvider>
+          </nav>
+        </div>
+      </div>
+    </>
   );
 }
