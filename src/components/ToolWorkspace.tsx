@@ -14,10 +14,12 @@ import { motion } from 'motion/react';
 import { ToolPageData, TOOLS_BY_SLUG } from '../data/tools';
 import {
   formatBytes,
+  getFormattedSizeParts,
   ProcessedImageResult,
   IngestedFileItem,
   ingestFiles,
   releaseIngestedItem,
+  releaseProcessedResultUrls,
   compressOrConvertImage,
   compressToTargetKB,
   resizeImageFile,
@@ -35,8 +37,7 @@ import {
 } from '../lib/image-processing';
 import {
   useCanvasCheck,
-  canvasIsTampered,
-  isBrave,
+  runTamperCheckDetailed,
   getShieldsWarningMessage,
 } from '../lib/canvas-check';
 import { FileUpload } from './ui/file-upload';
@@ -44,11 +45,10 @@ import { Slider } from './ui/slider';
 import { ToggleGroup, ToggleGroupItem } from './ui/toggle-group';
 import { Progress } from './ui/progress';
 import { Badge } from './ui/badge';
-import { Skeleton } from './ui/skeleton';
+import { Compare } from './ui/compare';
 import { toast } from './ui/sonner';
 
 const LazyNumberTicker = lazy(() => import('./ui/number-ticker'));
-const LazyCompare = lazy(() => import('./ui/compare'));
 
 interface ToolWorkspaceProps {
   tool: ToolPageData;
@@ -57,7 +57,7 @@ interface ToolWorkspaceProps {
 
 interface BatchItem extends IngestedFileItem {
   result?: ProcessedImageResult;
-  shieldsBlocked?: boolean;
+  originalDownloadUrl?: string;
 }
 
 function CanvasBlockedNotice({
@@ -112,7 +112,13 @@ function CanvasBlockedNotice({
                 Click the Brave Shields icon on the right side of the address bar.
               </li>
               <li>
-                Switch <strong className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">Shields</strong> off for this site, wait for the page to reload, or tap <strong className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">Check again</strong> below.
+                Switch{' '}
+                <strong className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">Shields</strong>{' '}
+                off for this site, wait for the page to reload, or tap{' '}
+                <strong className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">
+                  Check again
+                </strong>{' '}
+                below.
               </li>
             </ol>
           </details>
@@ -145,15 +151,9 @@ function CanvasBlockedNotice({
 function ErrorNotice({
   message,
   details,
-  isShieldsError,
-  isChecking,
-  onCheckAgain,
 }: {
   message: string;
   details?: string;
-  isShieldsError?: boolean;
-  isChecking?: boolean;
-  onCheckAgain?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -175,16 +175,6 @@ function ErrorNotice({
       <p className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] break-words leading-[1.5]">
         {message}
       </p>
-      {isShieldsError && onCheckAgain && (
-        <button
-          type="button"
-          onClick={onCheckAgain}
-          disabled={isChecking}
-          className="btn-press min-h-[48px] sm:min-h-[38px] w-full sm:w-auto px-[16px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center hover:bg-[#E5542B] cursor-pointer"
-        >
-          {isChecking ? 'Checking...' : 'Check again'}
-        </button>
-      )}
       {details && (
         <details className="text-[12px] text-[#6B6B66] dark:text-[#9B9B95]">
           <summary className="min-h-[44px] sm:min-h-[28px] cursor-pointer inline-flex items-center gap-[4px] hover:text-[#1A1A1A] dark:hover:text-[#EDEDEA] select-none underline underline-offset-2">
@@ -208,55 +198,86 @@ function ErrorNotice({
   );
 }
 
-function PreviewImageWithSkeleton({
+/**
+ * Stable preview image with zero shimmer, zero skeleton, and zero blank frames:
+ * - Reserves aspect-ratio box from known width and height before the image loads
+ * - Keeps the current image visible while pre-decoding the next URL offscreen, then swaps
+ */
+function StablePreviewImage({
   src,
   alt,
+  aspectRatio,
   className = '',
 }: {
   src: string;
   alt: string;
+  aspectRatio?: number;
   className?: string;
 }) {
-  const [loaded, setLoaded] = useState(false);
-  const imgRef = useRef<HTMLImageElement>(null);
+  const [displayedSrc, setDisplayedSrc] = useState(src);
 
   useEffect(() => {
-    const img = imgRef.current;
-    if (img && img.complete && img.naturalWidth > 0) {
-      setLoaded(true);
-    } else {
-      setLoaded(false);
+    if (!src) {
+      setDisplayedSrc('');
+      return;
     }
+    if (!displayedSrc) {
+      setDisplayedSrc(src);
+    }
+    let cancelled = false;
+    const preloader = new Image();
+    preloader.decoding = 'async';
+    preloader.onload = () => {
+      if (!cancelled) {
+        setDisplayedSrc(src);
+      }
+    };
+    preloader.onerror = () => {
+      if (!cancelled) {
+        setDisplayedSrc(src);
+      }
+    };
+    preloader.src = src;
+    if (typeof preloader.decode === 'function') {
+      preloader
+        .decode()
+        .then(() => {
+          if (!cancelled) {
+            setDisplayedSrc(src);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
   }, [src]);
 
   return (
-    <div className="relative flex w-full items-center justify-center min-h-[240px]">
-      {!loaded && (
-        <Skeleton
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 rounded-[10px]"
+    <div
+      style={{
+        aspectRatio: aspectRatio ? `${aspectRatio}` : undefined,
+      }}
+      className="relative flex w-full max-w-full max-h-[380px] min-h-[240px] items-center justify-center overflow-hidden rounded-[10px] bg-[#F7F6F3] dark:bg-[#0E0E0E]"
+    >
+      {displayedSrc ? (
+        <img
+          src={displayedSrc}
+          alt={alt}
+          className={`${className} opacity-100 select-none`}
+          draggable={false}
         />
-      )}
-      <img
-        ref={imgRef}
-        src={src}
-        alt={alt}
-        onLoad={() => setLoaded(true)}
-        onError={() => setLoaded(true)}
-        className={`${className} relative z-10 opacity-100`}
-      />
+      ) : null}
     </div>
   );
 }
-
-const STATUS_STAGES = ['Reading photo', 'Shrinking', 'Finishing'] as const;
 
 export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const jobIdRef = useRef<number>(0);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastExecutedTriggerRef = useRef<number>(0);
+  const retiredResultsRef = useRef<ProcessedImageResult[]>([]);
 
   const { tampered, brave, isChecking, checkAgain } = useCanvasCheck();
   const [noticeDismissed, setNoticeDismissed] = useState(false);
@@ -267,14 +288,15 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
 
   const [activeIndex, setActiveIndex] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [statusStageIdx, setStatusStageIdx] = useState<number>(0);
-  const [progressText, setProgressText] = useState<string>('');
+  const [isPendingUpdate, setIsPendingUpdate] = useState(false);
   const [progressRatio, setProgressRatio] = useState<number>(0);
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
 
   // Compress & Convert controls
-  const [quality, setQuality] = useState<number>(80);
-  const [outputMime, setOutputMime] = useState<'image/jpeg' | 'image/png' | 'image/webp'>('image/jpeg');
+  const [quality, setQuality] = useState<number>(78);
+  const [outputMime, setOutputMime] = useState<'image/jpeg' | 'image/png' | 'image/webp'>(
+    'image/jpeg'
+  );
   const [bgColor, setBgColor] = useState<string>('#FFFFFF');
 
   // Target KB controls (20KB, 50KB, 100KB)
@@ -296,7 +318,9 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   const [lockAspect, setLockAspect] = useState<boolean>(true);
 
   // Crop controls
-  const [cropAspect, setCropAspect] = useState<'free' | '1:1' | '4:5' | '16:9' | '3:2' | '4:3'>('free');
+  const [cropAspect, setCropAspect] = useState<'free' | '1:1' | '4:5' | '16:9' | '3:2' | '4:3'>(
+    'free'
+  );
   const [cropBox, setCropBox] = useState<{ x: number; y: number; width: number; height: number }>({
     x: 0.1,
     y: 0.1,
@@ -326,7 +350,9 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   const [watermarkPos, setWatermarkPos] = useState<WatermarkPosition>('bottom-right');
 
   // Black & White controls
-  const [bwPreset, setBwPreset] = useState<'standard' | 'high-contrast' | 'soft' | 'sepia'>('standard');
+  const [bwPreset, setBwPreset] = useState<'standard' | 'high-contrast' | 'soft' | 'sepia'>(
+    'standard'
+  );
   const [bwContrast, setBwContrast] = useState<number>(10);
   const [bwBrightness, setBwBrightness] = useState<number>(0);
 
@@ -339,7 +365,6 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   const [pdfError, setPdfError] = useState<{
     message: string;
     details?: string;
-    shieldsBlocked?: boolean;
   } | null>(null);
 
   const [processTrigger, setProcessTrigger] = useState<{ id: number; debounce: boolean }>({
@@ -354,16 +379,12 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
     tool.slug === 'convert-to-webp' ||
     tool.slug === 'image-to-pdf';
 
-  useEffect(() => {
-    if (!isProcessing) {
-      setStatusStageIdx(0);
-      return;
+  const flushRetiredResults = useCallback(() => {
+    for (const r of retiredResultsRef.current) {
+      releaseProcessedResultUrls(r);
     }
-    const interval = setInterval(() => {
-      setStatusStageIdx((prev) => (prev + 1) % STATUS_STAGES.length);
-    }, 420);
-    return () => clearInterval(interval);
-  }, [isProcessing]);
+    retiredResultsRef.current = [];
+  }, []);
 
   const cancelCurrentJob = useCallback(() => {
     jobIdRef.current += 1;
@@ -375,31 +396,40 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   }, []);
 
   const scheduleProcessing = useCallback((debounce: boolean) => {
-    setProcessTrigger((prev) => ({ id: prev.id + 1, debounce }));
+    jobIdRef.current += 1;
+    setIsPendingUpdate(true);
+    setProcessTrigger({ id: jobIdRef.current, debounce });
   }, []);
 
-  const cleanupItemsList = useCallback((list: BatchItem[]) => {
-    for (const item of list) {
-      releaseIngestedItem(item);
-    }
-  }, []);
+  const cleanupItemsList = useCallback(
+    (list: BatchItem[]) => {
+      flushRetiredResults();
+      for (const item of list) {
+        if (item.originalDownloadUrl) {
+          try {
+            URL.revokeObjectURL(item.originalDownloadUrl);
+          } catch {}
+        }
+        releaseIngestedItem(item);
+      }
+    },
+    [flushRetiredResults]
+  );
+
+  useEffect(() => {
+    return () => {
+      flushRetiredResults();
+    };
+  }, [flushRetiredResults]);
 
   const handleCheckAgain = useCallback(async () => {
     const res = await checkAgain();
     if (!res.tampered) {
       setNoticeDismissed(false);
-      setPdfError(null);
-      setItems((prev) =>
-        prev.map((it) =>
-          it.shieldsBlocked
-            ? { ...it, error: undefined, errorDetails: undefined, shieldsBlocked: false }
-            : it
-        )
-      );
-      if (itemsRef.current.some((it) => !it.error || it.shieldsBlocked)) {
+      toast('Canvas access verified');
+      if (itemsRef.current.some((it) => !it.error)) {
         scheduleProcessing(false);
       }
-      toast('Canvas access verified');
     } else {
       setNoticeDismissed(false);
     }
@@ -407,7 +437,6 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
 
   useEffect(() => {
     cancelCurrentJob();
-    lastExecutedTriggerRef.current = 0;
     setItems((prev) => {
       cleanupItemsList(prev);
       return [];
@@ -415,12 +444,12 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
     setActiveIndex(0);
     setWarningMessage(null);
     setPdfResult((prev) => {
-      if (prev?.url) URL.revokeObjectURL(prev.url);
+      releaseProcessedResultUrls(prev);
       return null;
     });
     setPdfError(null);
     setIsProcessing(false);
-    setProgressText('');
+    setIsPendingUpdate(false);
     setProgressRatio(0);
 
     if (tool.slug === 'convert-jpg-to-png') {
@@ -458,12 +487,12 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
     setActiveIndex(0);
     setWarningMessage(null);
     setPdfResult((prev) => {
-      if (prev?.url) URL.revokeObjectURL(prev.url);
+      releaseProcessedResultUrls(prev);
       return null;
     });
     setPdfError(null);
     setIsProcessing(false);
-    setProgressText('');
+    setIsPendingUpdate(false);
     setProgressRatio(0);
   };
 
@@ -503,23 +532,30 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         return;
       }
 
-      // Check if any intake failure happened while Brave Shields / canvas tampering is active
-      let processedIngested: BatchItem[] = ingested;
-      if (ingested.some((it) => it.error)) {
-        const [tamperedNow, braveNow] = await Promise.all([canvasIsTampered(), isBrave()]);
-        if (tamperedNow || braveNow) {
-          const shieldsMsg = getShieldsWarningMessage(braveNow);
-          processedIngested = ingested.map((it) =>
-            it.error
-              ? {
-                  ...it,
-                  error: shieldsMsg,
-                  shieldsBlocked: true,
-                }
-              : it
-          );
-          setNoticeDismissed(false);
-        }
+      // Create stable originalDownloadUrl once per ingested file so "Keep original" never recreates blob URLs
+      let processedIngested: BatchItem[] = ingested.map((it) => ({
+        ...it,
+        originalDownloadUrl: it.originalBlob ? URL.createObjectURL(it.originalBlob) : undefined,
+      }));
+
+      // If any file failed during intake, run the tamper check so Details includes the exact expected-vs-actual pixel report
+      if (processedIngested.some((it) => it.error)) {
+        const tamperRes = await runTamperCheckDetailed();
+        processedIngested = processedIngested.map((it) => {
+          if (!it.error) return it;
+          return {
+            ...it,
+            errorDetails: buildDiagnosticDetails(new Error(it.error), {
+              name: it.name,
+              type: it.type,
+              size: it.size,
+              dimensions: `${it.originalWidth} × ${it.originalHeight} px`,
+              stage: it.errorStage || 'decode',
+              tamperReport: tamperRes.report,
+              extra: it.errorDetails,
+            }),
+          };
+        });
       }
 
       const warnings = processedIngested.map((it) => it.warning).filter(Boolean);
@@ -561,7 +597,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         scheduleProcessing(false);
       } else {
         setIsProcessing(false);
-        setProgressText('');
+        setIsPendingUpdate(false);
         setProgressRatio(0);
       }
     },
@@ -610,6 +646,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
 
   const executeSingleToolPass = async (
     item: BatchItem,
+    currentJobId: number,
     forceMainThread: boolean
   ): Promise<ProcessedImageResult> => {
     if (tool.slug === 'compress-image') {
@@ -617,6 +654,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         quality,
         outputMimeType: outputMime,
         suffix: 'compressed',
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -625,6 +663,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         quality: 100,
         outputMimeType: 'image/png',
         suffix: 'converted',
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -634,6 +673,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         outputMimeType: 'image/jpeg',
         backgroundColor: bgColor,
         suffix: 'converted',
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -642,6 +682,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         quality,
         outputMimeType: 'image/webp',
         suffix: 'webp',
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -650,7 +691,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
       tool.slug === 'resize-image-to-50kb' ||
       tool.slug === 'resize-image-to-100kb'
     ) {
-      return compressToTargetKB(item, targetKB, forceMainThread);
+      return compressToTargetKB(item, targetKB, forceMainThread, currentJobId);
     }
     if (tool.slug === 'resize-image') {
       const finalW =
@@ -664,13 +705,14 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
       return resizeImageFile(item, {
         width: finalW,
         height: finalH,
-        quality: 88,
+        quality,
         outputMimeType: outputMime,
+        jobId: currentJobId,
         forceMainThread,
       });
     }
     if (tool.slug === 'crop-image') {
-      return cropImageFile(item, cropBox, outputMime, forceMainThread);
+      return cropImageFile(item, cropBox, outputMime, forceMainThread, currentJobId);
     }
     if (tool.slug === 'passport-photo-maker') {
       return generatePassportPhoto(item, {
@@ -680,6 +722,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         panY: passportPanY,
         brightenBackground: brightenBg,
         outputLayout: passportLayout,
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -689,6 +732,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         straightenAngle: straightenDeg,
         flipH,
         flipV,
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -699,6 +743,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         fontSizePercent: watermarkSize,
         color: watermarkColor,
         position: watermarkPos,
+        jobId: currentJobId,
         forceMainThread,
       });
     }
@@ -706,20 +751,18 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
       preset: bwPreset,
       contrast: bwContrast,
       brightness: bwBrightness,
+      jobId: currentJobId,
       forceMainThread,
     });
   };
 
   useEffect(() => {
     if (processTrigger.id === 0) return;
-    if (lastExecutedTriggerRef.current === processTrigger.id && !processTrigger.debounce) {
-      return;
-    }
 
     const validItems = itemsRef.current.filter((it) => !it.error);
-    if (validItems.length === 0 || tampered) {
+    if (validItems.length === 0) {
       setIsProcessing(false);
-      setProgressText('');
+      setIsPendingUpdate(false);
       setProgressRatio(0);
       return;
     }
@@ -729,12 +772,11 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
       debounceTimerRef.current = null;
     }
 
+    const currentJobId = processTrigger.id;
     const delay = processTrigger.debounce ? 300 : 0;
 
     debounceTimerRef.current = setTimeout(async () => {
-      lastExecutedTriggerRef.current = processTrigger.id;
-      jobIdRef.current += 1;
-      const currentJobId = jobIdRef.current;
+      if (jobIdRef.current !== currentJobId) return;
 
       setIsProcessing(true);
       setPdfError(null);
@@ -750,13 +792,11 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                 orientation: pdfOrientation,
                 marginPt: pdfMargin,
                 quality: pdfQuality,
+                jobId: currentJobId,
                 forceMainThread: false,
               },
               (current, total) => {
                 if (jobIdRef.current === currentJobId) {
-                  setProgressText(
-                    total > 1 ? `Shrinking (${current} of ${total})` : 'Shrinking'
-                  );
                   setProgressRatio(current / total);
                 }
               },
@@ -764,7 +804,6 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
             );
           } catch {
             if (jobIdRef.current !== currentJobId) return;
-            setProgressText('Processing failed, retrying...');
             resetImageWorker();
             res = await buildPdfFromImages(
               validItems,
@@ -773,15 +812,11 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                 orientation: pdfOrientation,
                 marginPt: pdfMargin,
                 quality: pdfQuality,
+                jobId: currentJobId,
                 forceMainThread: true,
               },
               (current, total) => {
                 if (jobIdRef.current === currentJobId) {
-                  setProgressText(
-                    total > 1
-                      ? `Retrying (${current} of ${total})`
-                      : 'Processing failed, retrying...'
-                  );
                   setProgressRatio(current / total);
                 }
               },
@@ -789,17 +824,17 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
             );
           }
 
-          if (jobIdRef.current !== currentJobId) {
-            URL.revokeObjectURL(res.url);
+          if (jobIdRef.current !== currentJobId || res.jobId !== currentJobId) {
+            releaseProcessedResultUrls(res);
             return;
           }
 
           setPdfResult((prev) => {
-            if (prev?.url) URL.revokeObjectURL(prev.url);
+            if (prev) retiredResultsRef.current.push(prev);
             return res;
           });
           setIsProcessing(false);
-          setProgressText('');
+          setIsPendingUpdate(false);
           setProgressRatio(1);
           return;
         }
@@ -807,30 +842,20 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         for (let i = 0; i < validItems.length; i++) {
           if (jobIdRef.current !== currentJobId) return;
           const item = validItems[i];
-          setProgressText(
-            validItems.length > 1
-              ? `Compressing... ${i + 1} of ${validItems.length}`
-              : STATUS_STAGES[statusStageIdx]
-          );
           setProgressRatio((i + 0.35) / validItems.length);
 
           try {
             let result: ProcessedImageResult;
             try {
-              result = await executeSingleToolPass(item, false);
-            } catch (firstErr) {
+              result = await executeSingleToolPass(item, currentJobId, false);
+            } catch {
               if (jobIdRef.current !== currentJobId) return;
-              if (!(firstErr instanceof ImageProcessError && firstErr.stage === 'canvas')) {
-                setProgressText('Processing failed, retrying...');
-                resetImageWorker();
-                result = await executeSingleToolPass(item, true);
-              } else {
-                throw firstErr;
-              }
+              resetImageWorker();
+              result = await executeSingleToolPass(item, currentJobId, true);
             }
 
-            if (jobIdRef.current !== currentJobId) {
-              URL.revokeObjectURL(result.url);
+            if (jobIdRef.current !== currentJobId || result.jobId !== currentJobId) {
+              releaseProcessedResultUrls(result);
               return;
             }
 
@@ -841,50 +866,47 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
             setItems((prev) =>
               prev.map((p) => {
                 if (p.id !== item.id) return p;
-                if (p.result?.url) URL.revokeObjectURL(p.result.url);
+                if (p.result) {
+                  retiredResultsRef.current.push(p.result);
+                }
                 return {
                   ...p,
                   result,
                   error: undefined,
                   errorDetails: undefined,
-                  shieldsBlocked: false,
                 };
               })
             );
             setProgressRatio((i + 1) / validItems.length);
           } catch (err) {
             if (jobIdRef.current !== currentJobId) return;
-            const [tamperedNow, braveNow] = await Promise.all([canvasIsTampered(), isBrave()]);
-            const isCanvasOrDecodeErr =
+            const tamperDetail = await runTamperCheckDetailed();
+            const stage =
+              err instanceof ImageProcessError ? err.stage : 'process';
+            const realErrorMsg =
               err instanceof ImageProcessError
-                ? err.stage === 'canvas' || err.stage === 'decode' || err.stage === 'process'
-                : true;
-            const showShieldsErr = tamperedNow || (braveNow && isCanvasOrDecodeErr);
-            const friendly = showShieldsErr
-              ? getShieldsWarningMessage(braveNow)
-              : err instanceof ImageProcessError
-              ? err.message
-              : ERROR_MSG_UNSUPPORTED_FORMAT;
-
-            if (showShieldsErr) {
-              setNoticeDismissed(false);
-            }
+                ? err.message
+                : err instanceof Error && err.message
+                ? err.message
+                : ERROR_MSG_UNSUPPORTED_FORMAT;
 
             const details = buildDiagnosticDetails(err, {
               name: item.name,
               type: item.type,
               size: item.size,
-              stage: 'process (after main-thread retry)',
+              dimensions: `${item.originalWidth} × ${item.originalHeight} px`,
+              stage,
+              tamperReport: tamperDetail.report,
             });
-            toast.error(`${item.name}: ${friendly}`);
+            toast.error(`${item.name}: ${realErrorMsg}`);
             setItems((prev) =>
               prev.map((p) =>
                 p.id === item.id
                   ? {
                       ...p,
-                      error: friendly,
+                      error: realErrorMsg,
+                      errorStage: stage,
                       errorDetails: details,
-                      shieldsBlocked: showShieldsErr,
                     }
                   : p
               )
@@ -894,24 +916,29 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
       } catch (err) {
         if (jobIdRef.current !== currentJobId) return;
         if (tool.slug === 'image-to-pdf') {
-          const [tamperedNow, braveNow] = await Promise.all([canvasIsTampered(), isBrave()]);
-          const showShieldsErr = tamperedNow || braveNow;
-          const msg = showShieldsErr
-            ? getShieldsWarningMessage(braveNow)
-            : err instanceof ImageProcessError
-            ? err.message
-            : 'Could not build PDF from the selected images.';
+          const tamperDetail = await runTamperCheckDetailed();
+          const msg =
+            err instanceof ImageProcessError
+              ? err.message
+              : err instanceof Error && err.message
+              ? err.message
+              : 'Could not build PDF from the selected images.';
           toast.error(msg);
           setPdfError({
             message: msg,
-            details: buildDiagnosticDetails(err, { stage: 'pdf-build' }),
-            shieldsBlocked: showShieldsErr,
+            details: buildDiagnosticDetails(err, {
+              stage: 'encode',
+              tamperReport: tamperDetail.report,
+            }),
           });
         }
       } finally {
         if (jobIdRef.current === currentJobId) {
           setIsProcessing(false);
-          setProgressText('');
+          setIsPendingUpdate(false);
+          setTimeout(() => {
+            flushRetiredResults();
+          }, 800);
         }
       }
     }, delay);
@@ -921,7 +948,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         clearTimeout(debounceTimerRef.current);
       }
     };
-  }, [processTrigger, tampered]);
+  }, [processTrigger, flushRetiredResults]);
 
   const activeItem =
     items[activeIndex] || items.find((i) => !i.error) || items[0] || null;
@@ -993,6 +1020,11 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
   const removeItem = (index: number) => {
     const target = items[index];
     if (target) {
+      if (target.originalDownloadUrl) {
+        try {
+          URL.revokeObjectURL(target.originalDownloadUrl);
+        } catch {}
+      }
       releaseIngestedItem(target);
     }
     const copy = items.filter((_, i) => i !== index);
@@ -1018,19 +1050,13 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
 
   const handleDownloadToast = (origBytes?: number, newBytes?: number) => {
     if (origBytes && newBytes && origBytes > newBytes) {
-      const savedPct = Math.round(((origBytes - newBytes) / origBytes) * 100);
-      toast(`Downloaded, saved ${savedPct}%`);
-    } else {
-      toast('Downloaded');
+      const savedPct = Math.round((1 - newBytes / origBytes) * 100);
+      if (savedPct > 0) {
+        toast(`Downloaded, saved ${savedPct}%`);
+        return;
+      }
     }
-  };
-
-  const formatMimeLabel = (mime?: string) => {
-    if (!mime) return 'JPG';
-    if (mime === 'image/png') return 'PNG';
-    if (mime === 'image/webp') return 'WebP';
-    if (mime === 'application/pdf') return 'PDF';
-    return 'JPG';
+    toast('Downloaded');
   };
 
   const renderTryAnotherToolSuggestions = () => {
@@ -1072,50 +1098,60 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
     );
   };
 
-  const renderSizeComparisonLine = (item: BatchItem) => {
-    if (!item.result) return null;
-    const origBytes = item.size;
-    const newBytes = item.result.sizeBytes;
-    const diffPct =
-      origBytes > 0 ? Math.round(((origBytes - newBytes) / origBytes) * 100) : 0;
+  const isUpdatingJob = isPendingUpdate || isProcessing;
 
-    const useMB = newBytes >= 1024 * 1024;
-    const unit = useMB ? 'MB' : 'KB';
-    const divisor = useMB ? 1024 * 1024 : 1024;
-    const startNumeric = Number((origBytes / divisor).toFixed(1));
-    const endNumeric = Number((newBytes / divisor).toFixed(1));
-    const resultKey = `${item.id}-${newBytes}-${diffPct}`;
-    const formatBadge = formatMimeLabel(item.result.mimeType);
+  const renderSizeComparisonLine = (item: BatchItem) => {
+    const res = item.result;
+    if (!res || isUpdatingJob || res.jobId !== jobIdRef.current) {
+      return (
+        <div className="space-y-[6px] min-w-0">
+          <p className="text-sm font-mono tabular-nums text-[#6B6B66] dark:text-[#9B9B95]">
+            {formatBytes(item.size)} → Updating...
+          </p>
+        </div>
+      );
+    }
+
+    const { originalBytes, newBytes, qualityUsed, format, width, height, jobId } = res;
+    const percentSaved =
+      originalBytes > 0 ? Math.round((1 - newBytes / originalBytes) * 100) : 0;
+    const isSmaller = newBytes < originalBytes && percentSaved > 0;
+
+    const origParts = getFormattedSizeParts(originalBytes);
+    const newParts = getFormattedSizeParts(newBytes);
+    const resultKey = `${item.id}-${jobId}-${newBytes}`;
 
     return (
-      <div className="space-y-[8px] min-w-0">
+      <div className="space-y-[10px] min-w-0">
         <div className="flex flex-wrap items-center gap-x-[8px] gap-y-[4px] text-sm text-[#1A1A1A] dark:text-[#EDEDEA] min-w-0 tabular-nums">
           <span className="font-mono text-[#6B6B66] dark:text-[#9B9B95]">
-            {formatBytes(origBytes)}
+            {formatBytes(originalBytes)}
           </span>
           <span className="text-[#6B6B66] dark:text-[#9B9B95]">→</span>
           <span className="font-mono font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">
-            <Suspense fallback={<span>{endNumeric.toFixed(1)}</span>}>
+            <Suspense fallback={<span>{newParts.value.toFixed(newParts.decimals)}</span>}>
               <LazyNumberTicker
                 key={`size-${resultKey}`}
-                startValue={startNumeric}
-                value={endNumeric}
-                decimalPlaces={1}
+                startValue={
+                  origParts.unit === newParts.unit ? origParts.value : newParts.value
+                }
+                value={newParts.value}
+                decimalPlaces={newParts.decimals}
               />
             </Suspense>{' '}
-            {unit}
+            {newParts.unit}
           </span>
-          {diffPct > 0 ? (
+          {isSmaller ? (
             <Badge
               key={`saved-${resultKey}`}
               variant="accent"
               className="animate-spring-pop"
             >
-              <Suspense fallback={<span>{diffPct}</span>}>
+              <Suspense fallback={<span>{percentSaved}</span>}>
                 <LazyNumberTicker
                   key={`pct-${resultKey}`}
                   startValue={0}
-                  value={diffPct}
+                  value={percentSaved}
                   decimalPlaces={0}
                   className="text-[#E5542B] dark:text-[#E5542B]"
                 />
@@ -1127,34 +1163,58 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
           )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-[8px] text-xs font-mono text-[#6B6B66] dark:text-[#9B9B95] tabular-nums">
-          <Badge variant="outline">{formatBadge}</Badge>
-          {item.result.width > 0 && item.result.height > 0 && (
-            <span>
-              {item.result.width} × {item.result.height} px
-            </span>
-          )}
+        {/* Applied settings line: e.g. "JPG · quality 78% · 1080 × 2460 px" */}
+        <div className="flex flex-wrap items-center gap-[6px] text-xs font-mono text-[#6B6B66] dark:text-[#9B9B95] tabular-nums">
+          <span>
+            {format} ·{' '}
+            {qualityUsed !== null ? `quality ${qualityUsed}%` : 'lossless'} · {width} ×{' '}
+            {height} px
+          </span>
         </div>
+
+        {!isSmaller && (
+          <div className="rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-[#F7F6F3] dark:bg-[#0E0E0E] p-[12px] text-xs text-[#1A1A1A] dark:text-[#EDEDEA] flex flex-col sm:flex-row sm:items-center justify-between gap-[10px]">
+            <span>
+              Already well optimized. The output isn&apos;t smaller than the original.
+            </span>
+            {item.originalDownloadUrl && (
+              <a
+                href={item.originalDownloadUrl}
+                download={item.name}
+                onClick={() => toast('Downloaded original file')}
+                className="btn-press min-h-[36px] px-[12px] py-[6px] rounded-[8px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] hover:border-[#E5542B] text-xs font-medium text-[#1A1A1A] dark:text-[#EDEDEA] inline-flex items-center justify-center shrink-0"
+              >
+                Keep original ({formatBytes(originalBytes)})
+              </a>
+            )}
+          </div>
+        )}
       </div>
     );
   };
 
-  const showComparePreview =
-    Boolean(activeItem?.result && activeItem?.previewUrl) &&
-    (tool.slug === 'compress-image' ||
-      tool.slug === 'resize-image' ||
-      tool.slug === 'resize-image-to-20kb' ||
-      tool.slug === 'resize-image-to-50kb' ||
-      tool.slug === 'resize-image-to-100kb' ||
-      tool.slug === 'convert-jpg-to-png' ||
-      tool.slug === 'convert-png-to-jpg' ||
-      tool.slug === 'convert-to-webp' ||
-      tool.slug === 'image-to-black-and-white' ||
-      tool.slug === 'add-watermark');
+  const usesComparePreview =
+    tool.slug === 'compress-image' ||
+    tool.slug === 'resize-image' ||
+    tool.slug === 'resize-image-to-20kb' ||
+    tool.slug === 'resize-image-to-50kb' ||
+    tool.slug === 'resize-image-to-100kb' ||
+    tool.slug === 'convert-jpg-to-png' ||
+    tool.slug === 'convert-png-to-jpg' ||
+    tool.slug === 'convert-to-webp' ||
+    tool.slug === 'image-to-black-and-white' ||
+    tool.slug === 'add-watermark';
 
   const isBatchJob = items.filter((it) => !it.error).length > 1;
   const hasReadyDownload =
-    tool.slug === 'image-to-pdf' ? Boolean(pdfResult) : Boolean(activeItem?.result);
+    tool.slug === 'image-to-pdf'
+      ? Boolean(pdfResult && !isUpdatingJob)
+      : Boolean(activeItem?.result && !isUpdatingJob);
+
+  const activeAspectRatio =
+    activeItem && activeItem.width > 0 && activeItem.height > 0
+      ? activeItem.width / activeItem.height
+      : undefined;
 
   return (
     <section
@@ -1181,7 +1241,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
         aria-label="Take a photo"
       />
 
-      {/* Calm, dismissible Brave Shields / Canvas Tampered Notice above the drop zone */}
+      {/* Advisory Brave Shields / Canvas Tampered Notice shown ONCE at the top of the workspace ONLY when canvasIsTampered() returns true */}
       {tampered && !noticeDismissed && (
         <CanvasBlockedNotice
           brave={brave}
@@ -1221,10 +1281,10 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
           }}
           className="relative w-full max-w-full overflow-hidden rounded-[14px] border border-[#E7E5E0] dark:border-[#262624] bg-white dark:bg-[#161616] p-[20px] sm:p-[32px] box-border"
         >
-          {isProcessing && (
+          {isUpdatingJob && (
             <Progress
-              value={Math.max(15, Math.round(progressRatio * 100))}
-              indeterminate={!isBatchJob}
+              value={isBatchJob ? Math.max(15, Math.round(progressRatio * 100)) : 65}
+              indeterminate={false}
               aria-label="Image processing progress"
               className="absolute top-0 left-0 right-0 z-20 rounded-none"
             />
@@ -1235,28 +1295,37 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
             <div className="lg:col-span-5 space-y-[24px] w-full max-w-full min-w-0">
               {tool.slug === 'compress-image' && (
                 <div className="space-y-[24px] min-w-0">
-                  <div className="min-w-0">
-                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] mb-[6px] min-w-0">
-                      <label htmlFor="quality-slider" className="truncate">
-                        Compression quality
+                  <div className="min-w-0 space-y-[6px]">
+                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] min-w-0">
+                      <label htmlFor="quality-slider" className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                        Quality
                       </label>
                       <span className="font-mono tabular-nums text-[#1A1A1A] dark:text-[#EDEDEA] shrink-0">
-                        {quality}%
+                        {outputMime === 'image/png' ? 'Lossless' : `${quality}%`}
                       </span>
                     </div>
+                    <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5]">
+                      Higher keeps more detail and a larger file. This isn&apos;t the percentage saved.
+                    </p>
                     <Slider
                       id="quality-slider"
                       min={10}
                       max={98}
                       step={1}
+                      disabled={outputMime === 'image/png'}
                       value={[quality]}
                       formatValue={(v) => `${v}%`}
                       onValueChange={(vals) => {
-                        setQuality(vals[0] ?? 80);
+                        setQuality(vals[0] ?? 78);
                         scheduleProcessing(true);
                       }}
-                      aria-label="Compression quality"
+                      aria-label="Quality"
                     />
+                    {outputMime === 'image/png' && (
+                      <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5] pt-[2px]">
+                        PNG is lossless, so quality doesn&apos;t apply. Choose JPG or WebP for smaller files.
+                      </p>
+                    )}
                   </div>
 
                   <div className="min-w-0">
@@ -1435,26 +1504,83 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                       />
                     </div>
                   )}
+
+                  <div className="min-w-0 space-y-[6px]">
+                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] min-w-0">
+                      <label htmlFor="resize-quality-slider" className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                        Quality
+                      </label>
+                      <span className="font-mono tabular-nums text-[#1A1A1A] dark:text-[#EDEDEA] shrink-0">
+                        {outputMime === 'image/png' ? 'Lossless' : `${quality}%`}
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5]">
+                      Higher keeps more detail and a larger file. This isn&apos;t the percentage saved.
+                    </p>
+                    <Slider
+                      id="resize-quality-slider"
+                      min={10}
+                      max={98}
+                      step={1}
+                      disabled={outputMime === 'image/png'}
+                      value={[quality]}
+                      formatValue={(v) => `${v}%`}
+                      onValueChange={(vals) => {
+                        setQuality(vals[0] ?? 88);
+                        scheduleProcessing(true);
+                      }}
+                      aria-label="Quality"
+                    />
+                    {outputMime === 'image/png' && (
+                      <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5] pt-[2px]">
+                        PNG is lossless, so quality doesn&apos;t apply. Choose JPG or WebP for smaller files.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="min-w-0">
+                    <label className="block text-[14px] text-[#6B6B66] dark:text-[#9B9B95] mb-[8px]">
+                      Output format
+                    </label>
+                    <ToggleGroup
+                      type="single"
+                      spacing={0}
+                      value={outputMime}
+                      onValueChange={(val) => {
+                        if (!val) return;
+                        setOutputMime(val as 'image/jpeg' | 'image/png' | 'image/webp');
+                        scheduleProcessing(false);
+                      }}
+                      aria-label="Output format"
+                    >
+                      <ToggleGroupItem value="image/jpeg">JPG</ToggleGroupItem>
+                      <ToggleGroupItem value="image/webp">WebP</ToggleGroupItem>
+                      <ToggleGroupItem value="image/png">PNG</ToggleGroupItem>
+                    </ToggleGroup>
+                  </div>
                 </div>
               )}
 
               {tool.slug === 'convert-jpg-to-png' && (
                 <p className="text-[14px] text-[#6B6B66] dark:text-[#9B9B95] leading-relaxed">
-                  Lossless PNG output preserves sharp edges and supports transparent layers.
+                  PNG is lossless, so quality doesn&apos;t apply. Choose JPG or WebP for smaller files.
                 </p>
               )}
 
               {tool.slug === 'convert-png-to-jpg' && (
                 <div className="space-y-[24px] min-w-0">
-                  <div className="min-w-0">
-                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] mb-[6px] min-w-0">
-                      <label htmlFor="png-jpg-q" className="truncate">
-                        JPEG quality
+                  <div className="min-w-0 space-y-[6px]">
+                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] min-w-0">
+                      <label htmlFor="png-jpg-q" className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                        Quality
                       </label>
                       <span className="font-mono tabular-nums text-[#1A1A1A] dark:text-[#EDEDEA] shrink-0">
                         {quality}%
                       </span>
                     </div>
+                    <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5]">
+                      Higher keeps more detail and a larger file. This isn&apos;t the percentage saved.
+                    </p>
                     <Slider
                       id="png-jpg-q"
                       min={20}
@@ -1466,7 +1592,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                         setQuality(vals[0] ?? 88);
                         scheduleProcessing(true);
                       }}
-                      aria-label="JPEG quality"
+                      aria-label="Quality"
                     />
                   </div>
                   <div className="min-w-0">
@@ -1493,15 +1619,18 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
               )}
 
               {tool.slug === 'convert-to-webp' && (
-                <div className="min-w-0">
-                  <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] mb-[6px] min-w-0">
-                    <label htmlFor="webp-q" className="truncate">
-                      WebP quality
+                <div className="min-w-0 space-y-[6px]">
+                  <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] min-w-0">
+                    <label htmlFor="webp-q" className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                      Quality
                     </label>
                     <span className="font-mono tabular-nums text-[#1A1A1A] dark:text-[#EDEDEA] shrink-0">
                       {quality}%
                     </span>
                   </div>
+                  <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5]">
+                    Higher keeps more detail and a larger file. This isn&apos;t the percentage saved.
+                  </p>
                   <Slider
                     id="webp-q"
                     min={20}
@@ -1513,7 +1642,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                       setQuality(vals[0] ?? 82);
                       scheduleProcessing(true);
                     }}
-                    aria-label="WebP quality"
+                    aria-label="Quality"
                   />
                 </div>
               )}
@@ -2077,15 +2206,18 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                     </div>
                   )}
 
-                  <div className="min-w-0">
-                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] mb-[6px] min-w-0">
-                      <label htmlFor="pdf-q" className="truncate">
-                        Image quality
+                  <div className="min-w-0 space-y-[6px]">
+                    <div className="flex items-center justify-between gap-[8px] text-[14px] text-[#6B6B66] dark:text-[#9B9B95] min-w-0">
+                      <label htmlFor="pdf-q" className="font-medium text-[#1A1A1A] dark:text-[#EDEDEA] truncate">
+                        Quality
                       </label>
                       <span className="font-mono tabular-nums text-[#1A1A1A] dark:text-[#EDEDEA] shrink-0">
                         {pdfQuality}%
                       </span>
                     </div>
+                    <p className="text-xs text-[#6B6B66] dark:text-[#9B9B95] leading-[1.5]">
+                      Higher keeps more detail and a larger file. This isn&apos;t the percentage saved.
+                    </p>
                     <Slider
                       id="pdf-q"
                       min={40}
@@ -2097,7 +2229,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                         setPdfQuality(vals[0] ?? 82);
                         scheduleProcessing(true);
                       }}
-                      aria-label="PDF embedded image quality"
+                      aria-label="Quality"
                     />
                   </div>
                 </div>
@@ -2132,139 +2264,137 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                 </div>
 
                 <ul className="divide-y divide-[#E7E5E0] dark:divide-[#262624] min-w-0 max-w-full">
-                  {items.map((item, idx) => (
-                    <motion.li
-                      layout
-                      key={item.id}
-                      className="py-[10px] text-sm min-w-0 max-w-full"
-                    >
-                      <div
-                        onClick={() => !item.error && setActiveIndex(idx)}
-                        className={`relative flex items-center justify-between gap-[10px] rounded-[10px] px-[8px] py-[6px] min-w-0 max-w-full transition-colors duration-150 ${
-                          !item.error ? 'cursor-pointer' : ''
-                        }`}
+                  {items.map((item, idx) => {
+                    const rowResult = item.result;
+                    const rowOriginalBytes = rowResult ? rowResult.originalBytes : item.size;
+                    const rowNewBytes = rowResult?.newBytes;
+                    const rowJobFresh =
+                      rowResult && !isUpdatingJob && rowResult.jobId === jobIdRef.current;
+
+                    return (
+                      <motion.li
+                        layout
+                        key={item.id}
+                        className="py-[10px] text-sm min-w-0 max-w-full"
                       >
-                        {idx === activeIndex && !item.error && (
-                          <motion.div
-                            layoutId={`active-file-pill-${tool.slug}`}
-                            className="pointer-events-none absolute inset-0 rounded-[10px] border border-[#E5542B]/40 bg-[#F7F6F3] dark:bg-[#0E0E0E]"
-                            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                          />
-                        )}
-                        <div className="relative z-10 flex items-center gap-[10px] min-w-0 flex-1">
-                          {item.thumbnailUrl && (
-                            <img
-                              src={item.thumbnailUrl}
-                              alt=""
-                              className="w-[48px] h-[48px] rounded-[8px] object-cover shrink-0 border border-[#E7E5E0] dark:border-[#262624] bg-[#F7F6F3] dark:bg-[#0E0E0E]"
+                        <div
+                          onClick={() => !item.error && setActiveIndex(idx)}
+                          className={`relative flex items-center justify-between gap-[10px] rounded-[10px] px-[8px] py-[6px] min-w-0 max-w-full transition-colors duration-150 ${
+                            !item.error ? 'cursor-pointer' : ''
+                          }`}
+                        >
+                          {idx === activeIndex && !item.error && (
+                            <motion.div
+                              layoutId={`active-file-pill-${tool.slug}`}
+                              className="pointer-events-none absolute inset-0 rounded-[10px] border border-[#E5542B]/40 bg-[#F7F6F3] dark:bg-[#0E0E0E]"
+                              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
                             />
                           )}
-                          <div className="min-w-0 flex-1">
-                            <div
-                              className={`truncate min-w-0 ${
-                                idx === activeIndex && !item.error
-                                  ? 'font-medium text-[#1A1A1A] dark:text-[#EDEDEA]'
-                                  : 'text-[#6B6B66] dark:text-[#9B9B95]'
-                              }`}
-                              title={item.name}
-                            >
-                              {item.name}
+                          <div className="relative z-10 flex items-center gap-[10px] min-w-0 flex-1">
+                            {item.thumbnailUrl && (
+                              <img
+                                src={item.thumbnailUrl}
+                                alt=""
+                                className="w-[48px] h-[48px] rounded-[8px] object-cover opacity-100 shrink-0 border border-[#E7E5E0] dark:border-[#262624] bg-[#F7F6F3] dark:bg-[#0E0E0E]"
+                              />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <div
+                                className={`truncate min-w-0 ${
+                                  idx === activeIndex && !item.error
+                                    ? 'font-medium text-[#1A1A1A] dark:text-[#EDEDEA]'
+                                    : 'text-[#6B6B66] dark:text-[#9B9B95]'
+                                }`}
+                                title={item.name}
+                              >
+                                {item.name}
+                              </div>
+                              <div className="text-xs font-mono tabular-nums text-[#6B6B66] dark:text-[#9B9B95]">
+                                {formatBytes(rowOriginalBytes)}
+                                {tool.slug !== 'image-to-pdf' && !item.error && (
+                                  <span className="text-[#2F6B4F] dark:text-[#4EA87D]">
+                                    {' → '}
+                                    {rowJobFresh && typeof rowNewBytes === 'number'
+                                      ? formatBytes(rowNewBytes)
+                                      : 'Updating...'}
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                            <div className="text-xs font-mono tabular-nums text-[#6B6B66] dark:text-[#9B9B95]">
-                              {formatBytes(item.size)}
-                              {item.result && tool.slug !== 'image-to-pdf' && (
-                                <span className="text-[#2F6B4F] dark:text-[#4EA87D]">
-                                  {' → '}
-                                  {formatBytes(item.result.sizeBytes)}
-                                </span>
-                              )}
-                            </div>
+                          </div>
+
+                          <div className="relative z-10 flex items-center gap-[4px] shrink-0">
+                            {tool.slug === 'image-to-pdf' && items.length > 1 && !item.error && (
+                              <div className="flex items-center gap-[2px] text-xs text-[#6B6B66]">
+                                <button
+                                  type="button"
+                                  disabled={idx === 0}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    moveItem(idx, -1);
+                                  }}
+                                  className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] hover:text-[#E5542B] disabled:opacity-30 cursor-pointer"
+                                  aria-label="Move up"
+                                >
+                                  <ArrowUp strokeWidth={1.5} className="w-[15px] h-[15px]" />
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={idx === items.length - 1}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    moveItem(idx, 1);
+                                  }}
+                                  className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] hover:text-[#E5542B] disabled:opacity-30 cursor-pointer"
+                                  aria-label="Move down"
+                                >
+                                  <ArrowDown strokeWidth={1.5} className="w-[15px] h-[15px]" />
+                                </button>
+                              </div>
+                            )}
+
+                            {items.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removeItem(idx);
+                                }}
+                                className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] text-[#6B6B66] hover:text-[#E5542B] cursor-pointer shrink-0"
+                                aria-label={`Remove ${item.name}`}
+                              >
+                                <X strokeWidth={1.5} className="w-[16px] h-[16px]" />
+                              </button>
+                            )}
                           </div>
                         </div>
 
-                        <div className="relative z-10 flex items-center gap-[4px] shrink-0">
-                          {tool.slug === 'image-to-pdf' && items.length > 1 && !item.error && (
-                            <div className="flex items-center gap-[2px] text-xs text-[#6B6B66]">
-                              <button
-                                type="button"
-                                disabled={idx === 0}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  moveItem(idx, -1);
-                                }}
-                                className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] hover:text-[#E5542B] disabled:opacity-30 cursor-pointer"
-                                aria-label="Move up"
-                              >
-                                <ArrowUp strokeWidth={1.5} className="w-[15px] h-[15px]" />
-                              </button>
-                              <button
-                                type="button"
-                                disabled={idx === items.length - 1}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  moveItem(idx, 1);
-                                }}
-                                className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] hover:text-[#E5542B] disabled:opacity-30 cursor-pointer"
-                                aria-label="Move down"
-                              >
-                                <ArrowDown strokeWidth={1.5} className="w-[15px] h-[15px]" />
-                              </button>
-                            </div>
-                          )}
-
-                          {items.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                removeItem(idx);
-                              }}
-                              className="min-h-[48px] min-w-[44px] inline-flex items-center justify-center rounded-[8px] text-[#6B6B66] hover:text-[#E5542B] cursor-pointer shrink-0"
-                              aria-label={`Remove ${item.name}`}
-                            >
-                              <X strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-
-                      {item.error && (
-                        <ErrorNotice
-                          message={item.error}
-                          details={item.errorDetails}
-                          isShieldsError={item.shieldsBlocked}
-                          isChecking={isChecking}
-                          onCheckAgain={handleCheckAgain}
-                        />
-                      )}
-                    </motion.li>
-                  ))}
+                        {item.error && (
+                          <ErrorNotice
+                            message={item.error}
+                            details={item.errorDetails}
+                          />
+                        )}
+                      </motion.li>
+                    );
+                  })}
                 </ul>
               </div>
             </div>
 
-            {/* Right Column: Result stacked vertically (1. Preview, then 2. Result summary card with size, format, dimensions, Download, and 3 Try another tool links) */}
-            <motion.div
-              layout
-              className="lg:col-span-7 lg:pl-[32px] lg:border-l border-[#E7E5E0] dark:border-[#262624] flex flex-col gap-[20px] w-full max-w-full min-w-0"
-            >
-              {isProcessing && (
+            {/* Right Column: Result stacked vertically (1. Preview, then 2. Result summary card) */}
+            <div className="lg:col-span-7 lg:pl-[32px] lg:border-l border-[#E7E5E0] dark:border-[#262624] flex flex-col gap-[20px] w-full max-w-full min-w-0">
+              {isUpdatingJob && (
                 <div
-                  className="flex items-center gap-[8px] text-sm text-[#6B6B66] dark:text-[#9B9B95] min-w-0"
+                  className="text-xs text-[#6B6B66] dark:text-[#9B9B95] min-w-0"
                   role="status"
                   aria-live="polite"
                 >
-                  <span
-                    className="inline-block w-[14px] h-[14px] rounded-full border-2 border-[#E5542B] border-t-transparent animate-spin shrink-0"
-                    aria-hidden="true"
-                  />
-                  <span key={statusStageIdx} className="animate-page-fade truncate">
-                    {progressText || STATUS_STAGES[statusStageIdx]}
-                  </span>
+                  Processing...
                 </div>
               )}
 
-              {/* 1. Preview Area First */}
+              {/* 1. Preview Area First (static neutral box, reserved aspect-ratio, zero shimmers/overlays) */}
               <div className="min-h-[260px] sm:min-h-[340px] w-full max-w-full rounded-[10px] bg-[#F7F6F3] dark:bg-[#0E0E0E] flex flex-col items-center justify-center p-[12px] sm:p-[16px] overflow-hidden box-border">
                 {tool.slug === 'image-to-pdf' ? (
                   <div className="w-full grid grid-cols-2 sm:grid-cols-3 gap-[12px] min-w-0">
@@ -2285,53 +2415,51 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                         </div>
                       ))}
                   </div>
-                ) : showComparePreview && activeItem?.result ? (
+                ) : usesComparePreview && activeItem?.previewUrl ? (
                   <div className="w-full flex flex-col items-center gap-[8px] min-w-0">
-                    <Suspense
-                      fallback={
-                        <Skeleton className="w-full h-[320px] rounded-[10px]" />
+                    <Compare
+                      firstImage={activeItem.previewUrl}
+                      secondImage={
+                        activeItem.result?.previewUrl ||
+                        activeItem.result?.url ||
+                        activeItem.previewUrl
                       }
-                    >
-                      <LazyCompare
-                        firstImage={activeItem.previewUrl}
-                        secondImage={activeItem.result.url}
-                        aspectRatio={
-                          activeItem.width > 0 && activeItem.height > 0
-                            ? activeItem.width / activeItem.height
-                            : undefined
-                        }
-                        slideMode="drag"
-                        firstLabel="Before"
-                        secondLabel="After"
-                      />
-                    </Suspense>
+                      aspectRatio={activeAspectRatio}
+                      slideMode="drag"
+                      firstLabel="Before"
+                      secondLabel="After"
+                    />
                     <p className="text-[11px] text-[#6B6B66] dark:text-[#9B9B95]">
                       Drag handle or use left/right arrow keys to compare
                     </p>
                   </div>
-                ) : activeItem?.result ? (
-                  <PreviewImageWithSkeleton
-                    src={activeItem.result.url}
-                    alt={`Processed preview for ${activeItem.name}`}
-                    className="max-h-[380px] max-w-full object-contain rounded-[8px] opacity-100"
-                  />
-                ) : activeItem?.previewUrl ? (
-                  <PreviewImageWithSkeleton
-                    src={activeItem.previewUrl}
+                ) : activeItem ? (
+                  <StablePreviewImage
+                    src={
+                      activeItem.result?.previewUrl ||
+                      activeItem.result?.url ||
+                      activeItem.previewUrl
+                    }
                     alt={`Preview for ${activeItem.name}`}
-                    className="max-h-[380px] max-w-full object-contain rounded-[8px] opacity-100"
+                    aspectRatio={
+                      activeItem.result && activeItem.result.width > 0 && activeItem.result.height > 0
+                        ? activeItem.result.width / activeItem.result.height
+                        : activeAspectRatio
+                    }
+                    className="max-h-[380px] max-w-full object-contain rounded-[8px]"
                   />
                 ) : null}
               </div>
 
-              {/* 2. Result Summary Card (original -> new size, % saved, format, dimensions, Download, and 3 Try another tool links) */}
+              {/* 2. Result Summary Card */}
               {tool.slug === 'image-to-pdf' ? (
-                <motion.div
-                  layout
-                  className="flex flex-col gap-[16px] pt-[16px] border-t border-[#E7E5E0] dark:border-[#262624] min-w-0"
-                >
+                <div className="flex flex-col gap-[16px] pt-[16px] border-t border-[#E7E5E0] dark:border-[#262624] min-w-0">
                   <div className="min-w-0 space-y-[8px]">
-                    {pdfResult ? (
+                    {isUpdatingJob ? (
+                      <p className="text-sm font-mono text-[#6B6B66] dark:text-[#9B9B95]">
+                        Updating...
+                      </p>
+                    ) : pdfResult ? (
                       <>
                         <p className="text-sm text-[#1A1A1A] dark:text-[#EDEDEA] flex flex-wrap items-center gap-[8px] tabular-nums">
                           <span>
@@ -2339,57 +2467,33 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                             {items.filter((i) => !i.error).length === 1 ? 'page' : 'pages'} →
                           </span>
                           <span className="font-mono font-medium">
-                            {formatBytes(pdfResult.sizeBytes)}
+                            {formatBytes(pdfResult.newBytes)}
                           </span>
                           <Badge variant="success" className="animate-spring-pop">
                             PDF ready
                           </Badge>
                         </p>
                         <div className="flex flex-wrap items-center gap-[8px] text-xs font-mono text-[#6B6B66] dark:text-[#9B9B95]">
-                          <Badge variant="outline">PDF</Badge>
-                          <span>{pdfPageSize.toUpperCase()}</span>
+                          <span>
+                            PDF · quality {pdfResult.qualityUsed ?? pdfQuality}% ·{' '}
+                            {pdfPageSize.toUpperCase()}
+                          </span>
                         </div>
                       </>
                     ) : pdfError ? (
                       <ErrorNotice
                         message={pdfError.message}
                         details={pdfError.details}
-                        isShieldsError={pdfError.shieldsBlocked}
-                        isChecking={isChecking}
-                        onCheckAgain={handleCheckAgain}
                       />
                     ) : (
                       <p className="text-sm text-[#6B6B66] dark:text-[#9B9B95]">
-                        {progressText || STATUS_STAGES[statusStageIdx]}
+                        Processing...
                       </p>
                     )}
                   </div>
 
-                  {tampered && (
-                    <div className="rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-[#F3EFEA] dark:bg-[#191816] p-[12px] text-sm text-[#1A1A1A] dark:text-[#EDEDEA] space-y-[8px]">
-                      <p>{getShieldsWarningMessage(brave)}</p>
-                      <button
-                        type="button"
-                        onClick={handleCheckAgain}
-                        disabled={isChecking}
-                        className="btn-press min-h-[48px] w-full sm:w-auto px-[16px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium cursor-pointer"
-                      >
-                        {isChecking ? 'Checking...' : 'Check again'}
-                      </button>
-                    </div>
-                  )}
-
                   <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-[10px] min-w-0">
-                    {tampered ? (
-                      <button
-                        type="button"
-                        disabled
-                        className="w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A]/40 text-white dark:bg-[#EDEDEA]/40 dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] cursor-not-allowed"
-                      >
-                        <Download strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                        <span>Download PDF (Blocked)</span>
-                      </button>
-                    ) : pdfResult ? (
+                    {pdfResult && !isUpdatingJob ? (
                       <a
                         href={pdfResult.url}
                         download={pdfResult.filename}
@@ -2397,16 +2501,15 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                         className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] hover:bg-[#E5542B] dark:hover:bg-[#E5542B] dark:hover:text-white text-sm font-medium inline-flex items-center justify-center gap-[8px] shrink-0"
                       >
                         <Download strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                        <span>Download PDF</span>
+                        <span>Download PDF ({formatBytes(pdfResult.newBytes)})</span>
                       </a>
                     ) : (
                       <button
                         type="button"
                         onClick={() => scheduleProcessing(false)}
-                        disabled={isProcessing || tampered}
-                        className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] disabled:opacity-50 cursor-pointer"
+                        className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] cursor-pointer"
                       >
-                        <span>Process PDF</span>
+                        <span>{isUpdatingJob ? 'Updating...' : 'Process PDF'}</span>
                       </button>
                     )}
 
@@ -2421,76 +2524,46 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                   </div>
 
                   {pdfResult && renderTryAnotherToolSuggestions()}
-                </motion.div>
+                </div>
               ) : (
                 activeItem && (
-                  <motion.div
-                    layout
-                    className="flex flex-col gap-[16px] pt-[16px] border-t border-[#E7E5E0] dark:border-[#262624] min-w-0"
-                  >
-                    {/* 2. Size Line + Format & Dimensions */}
+                  <div className="flex flex-col gap-[16px] pt-[16px] border-t border-[#E7E5E0] dark:border-[#262624] min-w-0">
+                    {/* 2. Size Line + Applied Settings */}
                     <div className="min-w-0">
-                      {activeItem.result ? (
-                        renderSizeComparisonLine(activeItem)
-                      ) : activeItem.error ? (
-                        <p className="text-sm text-[#6B6B66] dark:text-[#9B9B95]">
-                          {activeItem.error}
-                        </p>
+                      {activeItem.error ? (
+                        <ErrorNotice
+                          message={activeItem.error}
+                          details={activeItem.errorDetails}
+                        />
                       ) : (
-                        <p className="text-sm text-[#6B6B66] dark:text-[#9B9B95]">
-                          {progressText || STATUS_STAGES[statusStageIdx]}
-                        </p>
+                        renderSizeComparisonLine(activeItem)
                       )}
                     </div>
 
-                    {tampered && (
-                      <div className="rounded-[10px] border border-[#E7E5E0] dark:border-[#262624] bg-[#F3EFEA] dark:bg-[#191816] p-[12px] text-sm text-[#1A1A1A] dark:text-[#EDEDEA] space-y-[8px]">
-                        <p>{getShieldsWarningMessage(brave)}</p>
-                        <button
-                          type="button"
-                          onClick={handleCheckAgain}
-                          disabled={isChecking}
-                          className="btn-press min-h-[48px] w-full sm:w-auto px-[16px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium cursor-pointer"
-                        >
-                          {isChecking ? 'Checking...' : 'Check again'}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* 3. Actions (Full-width on mobile, min-h-48px) */}
+                    {/* 3. Actions (Never disabled by the Shields check) */}
                     <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-[10px] min-w-0">
-                      {tampered ? (
-                        <button
-                          type="button"
-                          disabled
-                          className="w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A]/40 text-white dark:bg-[#EDEDEA]/40 dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] cursor-not-allowed"
-                        >
-                          <Download strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                          <span>Download (Blocked)</span>
-                        </button>
-                      ) : activeItem.result ? (
+                      {activeItem.result && !isUpdatingJob ? (
                         <a
                           href={activeItem.result.url}
                           download={activeItem.result.filename}
                           onClick={() =>
                             handleDownloadToast(
-                              activeItem.size,
-                              activeItem.result?.sizeBytes
+                              activeItem.result?.originalBytes,
+                              activeItem.result?.newBytes
                             )
                           }
                           className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] hover:bg-[#E5542B] dark:hover:bg-[#E5542B] dark:hover:text-white text-sm font-medium inline-flex items-center justify-center gap-[8px] shrink-0"
                         >
                           <Download strokeWidth={1.5} className="w-[16px] h-[16px]" />
-                          <span>Download</span>
+                          <span>Download ({formatBytes(activeItem.result.newBytes)})</span>
                         </a>
                       ) : (
                         <button
                           type="button"
                           onClick={() => scheduleProcessing(false)}
-                          disabled={isProcessing || tampered}
-                          className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] disabled:opacity-50 cursor-pointer"
+                          className="btn-press w-full sm:w-auto min-h-[48px] px-[20px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] cursor-pointer"
                         >
-                          <span>Process photo</span>
+                          <span>{isUpdatingJob ? 'Updating...' : 'Process photo'}</span>
                         </button>
                       )}
 
@@ -2505,16 +2578,16 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                     </div>
 
                     {activeItem.result && renderTryAnotherToolSuggestions()}
-                  </motion.div>
+                  </div>
                 )
               )}
-            </motion.div>
+            </div>
           </div>
         </div>
       )}
 
       {/* Sticky mobile bottom action bar (< 640px) with Download (primary) and Start over, plus safe-area inset */}
-      {items.length > 0 && (hasReadyDownload || tampered) && (
+      {items.length > 0 && hasReadyDownload && (
         <div
           style={{
             paddingBottom: 'calc(12px + env(safe-area-inset-bottom, 0px))',
@@ -2522,16 +2595,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
           className="sm:hidden fixed bottom-0 inset-x-0 z-30 border-t border-[#E7E5E0] dark:border-[#262624] bg-[#F7F6F3]/95 dark:bg-[#0E0E0E]/95 backdrop-blur-md px-[20px] pt-[12px]"
         >
           <div className="grid grid-cols-3 gap-[8px] items-center">
-            {tampered ? (
-              <button
-                type="button"
-                disabled
-                className="col-span-2 min-h-[48px] px-[14px] rounded-[10px] bg-[#1A1A1A]/40 text-white dark:bg-[#EDEDEA]/40 dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[6px] cursor-not-allowed truncate"
-              >
-                <Download strokeWidth={1.5} className="w-[16px] h-[16px] shrink-0" />
-                <span className="truncate">Blocked by Shields</span>
-              </button>
-            ) : tool.slug === 'image-to-pdf' && pdfResult ? (
+            {tool.slug === 'image-to-pdf' && pdfResult ? (
               <a
                 href={pdfResult.url}
                 download={pdfResult.filename}
@@ -2540,7 +2604,7 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
               >
                 <Download strokeWidth={1.5} className="w-[16px] h-[16px] shrink-0" />
                 <span className="truncate">
-                  Download PDF ({formatBytes(pdfResult.sizeBytes)})
+                  Download PDF ({formatBytes(pdfResult.newBytes)})
                 </span>
               </a>
             ) : activeItem?.result ? (
@@ -2549,15 +2613,15 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
                 download={activeItem.result.filename}
                 onClick={() =>
                   handleDownloadToast(
-                    activeItem.size,
-                    activeItem.result?.sizeBytes
+                    activeItem.result?.originalBytes,
+                    activeItem.result?.newBytes
                   )
                 }
                 className="btn-press col-span-2 min-h-[48px] px-[14px] rounded-[10px] bg-[#1A1A1A] text-white dark:bg-[#EDEDEA] dark:text-[#0E0E0E] text-sm font-medium inline-flex items-center justify-center gap-[8px] truncate"
               >
                 <Download strokeWidth={1.5} className="w-[16px] h-[16px] shrink-0" />
                 <span className="truncate">
-                  Download ({formatBytes(activeItem.result.sizeBytes)})
+                  Download ({formatBytes(activeItem.result.newBytes)})
                 </span>
               </a>
             ) : null}
@@ -2578,4 +2642,3 @@ export function ToolWorkspace({ tool, onNavigate }: ToolWorkspaceProps) {
 }
 
 export default ToolWorkspace;
-

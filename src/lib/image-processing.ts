@@ -1,9 +1,19 @@
+import { getLastTamperReport } from './canvas-check';
+
+export type OutputFormatLabel = 'JPG' | 'PNG' | 'WebP' | 'PDF';
+
 export interface ProcessedImageResult {
   blob: Blob;
   url: string;
+  previewUrl: string;
+  originalBytes: number;
+  newBytes: number;
+  sizeBytes: number;
+  qualityUsed: number | null;
+  format: OutputFormatLabel;
   width: number;
   height: number;
-  sizeBytes: number;
+  jobId: number;
   filename: string;
   mimeType: string;
   timedOut?: boolean;
@@ -21,11 +31,11 @@ export interface IngestedFileItem {
   height: number; // Working height (longest side <= 2560)
   originalWidth: number; // Original natural width
   originalHeight: number; // Original natural height
-  previewUrl: string;
-  thumbnailUrl: string;
+  previewUrl: string; // Downscaled preview (longest side <= 1600)
+  thumbnailUrl: string; // File-list thumbnail (longest side <= 256)
   warning?: string;
   error?: string;
-  errorStage?: 'read' | 'decode' | 'canvas' | 'process';
+  errorStage?: 'read' | 'decode' | 'process' | 'encode';
   errorDetails?: string;
 }
 
@@ -39,24 +49,27 @@ export type WatermarkPosition =
 
 const MAX_WARNING_BYTES = 25 * 1024 * 1024; // 25 MB
 export const MAX_WORKING_DIMENSION = 2560;
+export const MAX_PREVIEW_DIMENSION = 1600;
+export const MAX_THUMB_DIMENSION = 256;
 const SAFETY_TIMEOUT_MS = 10000;
 
 export const ERROR_MSG_READ_BLOCKED =
-  'Your phone blocked access to this photo. Tap Choose photos again and pick it from Gallery or Files';
-export const ERROR_MSG_UNSUPPORTED_FORMAT = "This format isn't supported";
+  'Your phone blocked access to this photo. Tap Choose photos again and pick it from Gallery or Files.';
+export const ERROR_MSG_UNSUPPORTED_FORMAT =
+  "This image couldn't be decoded. It may be corrupted or in an unsupported encoding.";
 export const ERROR_MSG_HEIC_FAILED =
   "This HEIC photo can't be read in your browser. Change your camera format to JPG, or share it as a JPG from your gallery.";
 export const ERROR_MSG_CANVAS_BLOCKED =
-  'Your browser is blocking canvas access. Turn off Shields for this site or try Chrome.';
+  'Your browser blocked canvas pixel access while processing this image.';
 
 export class ImageProcessError extends Error {
   details: string;
-  stage: 'read' | 'decode' | 'canvas' | 'process';
+  stage: 'read' | 'decode' | 'process' | 'encode';
 
   constructor(
     friendlyMessage: string,
     details: string,
-    stage: 'read' | 'decode' | 'canvas' | 'process' = 'process'
+    stage: 'read' | 'decode' | 'process' | 'encode' = 'process'
   ) {
     super(friendlyMessage);
     this.name = 'ImageProcessError';
@@ -76,22 +89,37 @@ export function getDeviceCapabilitiesSummary(): string {
 
 export function buildDiagnosticDetails(
   err: unknown,
-  meta?: { name?: string; type?: string; size?: number; stage?: string; extra?: string }
+  meta?: {
+    name?: string;
+    type?: string;
+    size?: number;
+    dimensions?: string;
+    stage?: 'read' | 'decode' | 'process' | 'encode' | string;
+    tamperReport?: string;
+    extra?: string;
+  }
 ): string {
-  const errText =
-    err instanceof ImageProcessError && err.details
-      ? err.details
+  const errNameAndMsg =
+    err instanceof ImageProcessError
+      ? `${err.name}: ${err.message}${err.details ? ` (${err.details})` : ''}`
       : err instanceof Error
       ? `${err.name || 'Error'}: ${err.message || 'Unknown error'}`
       : typeof err === 'string'
       ? err
       : String(err);
 
+  const stageVal =
+    meta?.stage || (err instanceof ImageProcessError ? err.stage : 'process');
+  const tamperText = meta?.tamperReport || getLastTamperReport() || 'not-run';
+
   const lines = [
-    `Error: ${errText}`,
-    meta?.stage ? `Stage: ${meta.stage}` : null,
-    meta?.name ? `File: ${meta.name}` : null,
-    meta ? `MIME: ${meta.type || '(empty)'} | Size: ${meta.size ?? 0} bytes` : null,
+    `Stage: ${stageVal}`,
+    `Error: ${errNameAndMsg}`,
+    `File: ${meta?.name || 'unknown'}`,
+    `MIME Type: ${meta?.type || '(empty)'}`,
+    `Size: ${meta?.size ?? 0} bytes (${formatBytes(meta?.size ?? 0)})`,
+    `Dimensions: ${meta?.dimensions || 'unknown'}`,
+    `Tamper Check: ${tamperText}`,
     meta?.extra ? `Steps: ${meta.extra}` : null,
     `Capabilities: ${getDeviceCapabilitiesSummary()}`,
   ].filter(Boolean);
@@ -106,15 +134,66 @@ export function formatErrorDetails(err: unknown): string {
   return buildDiagnosticDetails(err);
 }
 
+/**
+ * Shared byte formatter used everywhere (file row, result line, summary card, and Number Ticker):
+ * - KB with one decimal under 1000 KB
+ * - MB with two decimals at or above 1000 KB
+ */
 export function formatBytes(bytes: number): string {
-  if (bytes <= 0) return '0 B';
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0.0 KB';
   const kb = bytes / 1024;
   if (kb < 1000) {
-    return `${kb < 100 ? kb.toFixed(1) : Math.round(kb)} KB`;
+    return `${kb.toFixed(1)} KB`;
   }
   const mb = kb / 1024;
   return `${mb.toFixed(2)} MB`;
+}
+
+export function getFormattedSizeParts(bytes: number): {
+  value: number;
+  decimals: number;
+  unit: 'KB' | 'MB';
+  formatted: string;
+} {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return { value: 0, decimals: 1, unit: 'KB', formatted: '0.0 KB' };
+  }
+  const kb = bytes / 1024;
+  if (kb < 1000) {
+    const val = Number(kb.toFixed(1));
+    return {
+      value: val,
+      decimals: 1,
+      unit: 'KB',
+      formatted: `${val.toFixed(1)} KB`,
+    };
+  }
+  const mb = kb / 1024;
+  const val = Number(mb.toFixed(2));
+  return {
+    value: val,
+    decimals: 2,
+    unit: 'MB',
+    formatted: `${val.toFixed(2)} MB`,
+  };
+}
+
+export function mimeToFormatLabel(mimeType: string): OutputFormatLabel {
+  const clean = (mimeType || '').toLowerCase();
+  if (clean === 'image/png') return 'PNG';
+  if (clean === 'image/webp') return 'WebP';
+  if (clean === 'application/pdf') return 'PDF';
+  return 'JPG';
+}
+
+export function normalizeOutputMimeType(
+  mimeType: string
+): 'image/jpeg' | 'image/png' | 'image/webp' | 'application/pdf' {
+  const clean = (mimeType || '').trim().toLowerCase();
+  if (clean === 'image/png') return 'image/png';
+  if (clean === 'image/webp') return 'image/webp';
+  if (clean === 'application/pdf') return 'application/pdf';
+  return 'image/jpeg';
 }
 
 /**
@@ -197,7 +276,11 @@ export function guessMimeType(
   return 'image/jpeg';
 }
 
-export function isHeicMimeOrName(fileName: string, mimeType: string, buffer?: ArrayBuffer | null): boolean {
+export function isHeicMimeOrName(
+  fileName: string,
+  mimeType: string,
+  buffer?: ArrayBuffer | null
+): boolean {
   const guessed = guessMimeType(fileName, mimeType, buffer);
   const lower = (fileName || '').toLowerCase();
   const typeLower = (mimeType || '').toLowerCase();
@@ -271,75 +354,6 @@ async function readArrayBufferWithRetry(file: File, retryDelayMs = 250): Promise
   }
 }
 
-/**
- * Detects if Brave Shields (strict fingerprinting protection) or another privacy blocker
- * has blocked canvas readback or zeroed out canvas pixel data.
- */
-function verifyCanvasNotBlocked(
-  canvas: HTMLCanvasElement,
-  ctx: CanvasRenderingContext2D
-): void {
-  try {
-    const w = canvas.width;
-    const h = canvas.height;
-    if (w <= 0 || h <= 0) return;
-
-    // Sample a 5x5 grid across the canvas
-    const points: Array<[number, number]> = [
-      [Math.floor(w * 0.5), Math.floor(h * 0.5)],
-      [Math.floor(w * 0.25), Math.floor(h * 0.25)],
-      [Math.floor(w * 0.75), Math.floor(h * 0.25)],
-      [Math.floor(w * 0.25), Math.floor(h * 0.75)],
-      [Math.floor(w * 0.75), Math.floor(h * 0.75)],
-      [Math.floor(w * 0.1), Math.floor(h * 0.9)],
-      [Math.floor(w * 0.9), Math.floor(h * 0.1)],
-    ];
-
-    let allTransparentZero = true;
-    for (const [px, py] of points) {
-      const data = ctx.getImageData(
-        Math.max(0, Math.min(w - 1, px)),
-        Math.max(0, Math.min(h - 1, py)),
-        1,
-        1
-      ).data;
-      if (data[0] !== 0 || data[1] !== 0 || data[2] !== 0 || data[3] !== 0) {
-        allTransparentZero = false;
-        break;
-      }
-    }
-
-    if (allTransparentZero) {
-      // Double-check a horizontal strip across the middle
-      const stripW = Math.min(64, w);
-      const strip = ctx.getImageData(0, Math.floor(h / 2), stripW, 1).data;
-      let anyNonZero = false;
-      for (let i = 0; i < strip.length; i++) {
-        if (strip[i] !== 0) {
-          anyNonZero = true;
-          break;
-        }
-      }
-      if (!anyNonZero) {
-        throw new ImageProcessError(
-          ERROR_MSG_CANVAS_BLOCKED,
-          'CanvasReadbackBlocked: Drawn canvas returned all-zero transparent pixels across sample regions.',
-          'canvas'
-        );
-      }
-    }
-  } catch (err) {
-    if (err instanceof ImageProcessError) {
-      throw err;
-    }
-    throw new ImageProcessError(
-      ERROR_MSG_CANVAS_BLOCKED,
-      `CanvasSecurityError: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
-      'canvas'
-    );
-  }
-}
-
 function drawDecodedSourceToWorkingCanvas(
   source: HTMLImageElement | ImageBitmap,
   origW: number,
@@ -365,15 +379,14 @@ function drawDecodedSourceToWorkingCanvas(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not initialize 2D canvas context on main thread.',
-      'canvas'
+      'decode'
     );
   }
 
+  ctx.clearRect(0, 0, width, height);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(source, 0, 0, width, height);
-
-  verifyCanvasNotBlocked(canvas, ctx);
 
   return {
     canvas,
@@ -394,15 +407,52 @@ async function decodeWithObjectUrl(blob: Blob, maxLongestSide: number) {
 
   const objectUrl = URL.createObjectURL(blob);
   try {
-    img.src = objectUrl;
-    await img.decode();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('HTMLImageElement onerror fired for object URL.'));
+      img.src = objectUrl;
+    });
+    if (typeof img.decode === 'function') {
+      try {
+        await img.decode();
+      } catch {}
+    }
     const origW = img.naturalWidth || img.width;
     const origH = img.naturalHeight || img.height;
     if (!origW || !origH) {
       throw new Error('Image decoded with zero dimensions (0x0).');
     }
-    const drawn = drawDecodedSourceToWorkingCanvas(img, origW, origH, maxLongestSide);
-    return drawn;
+
+    // If createImageBitmap with resize options is available and image is huge, try hardware-assisted resize with EXIF orientation
+    if (
+      typeof createImageBitmap === 'function' &&
+      Math.max(origW, origH) > maxLongestSide
+    ) {
+      const scale = maxLongestSide / Math.max(origW, origH);
+      const targetW = Math.max(1, Math.round(origW * scale));
+      const targetH = Math.max(1, Math.round(origH * scale));
+      try {
+        const resizedBmp = await createImageBitmap(blob, {
+          resizeWidth: targetW,
+          resizeHeight: targetH,
+          resizeQuality: 'high',
+          imageOrientation: 'from-image',
+        } as ImageBitmapOptions);
+        try {
+          const drawn = drawDecodedSourceToWorkingCanvas(
+            resizedBmp,
+            origW,
+            origH,
+            maxLongestSide
+          );
+          return drawn;
+        } finally {
+          resizedBmp.close();
+        }
+      } catch {}
+    }
+
+    return drawDecodedSourceToWorkingCanvas(img, origW, origH, maxLongestSide);
   } finally {
     // Only revoke AFTER the draw is finished
     URL.revokeObjectURL(objectUrl);
@@ -433,8 +483,16 @@ async function decodeWithDataUrl(blob: Blob, maxLongestSide: number) {
   } catch {}
 
   try {
-    img.src = dataUrl;
-    await img.decode();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('HTMLImageElement onerror fired for Data URL.'));
+      img.src = dataUrl;
+    });
+    if (typeof img.decode === 'function') {
+      try {
+        await img.decode();
+      } catch {}
+    }
     const origW = img.naturalWidth || img.width;
     const origH = img.naturalHeight || img.height;
     if (!origW || !origH) {
@@ -453,7 +511,9 @@ async function decodeWithBitmap(blob: Blob, maxLongestSide: number) {
   let bitmap: ImageBitmap | null = null;
   try {
     try {
-      bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' } as ImageBitmapOptions);
+      bitmap = await createImageBitmap(blob, {
+        imageOrientation: 'from-image',
+      } as ImageBitmapOptions);
     } catch {
       bitmap = await createImageBitmap(blob);
     }
@@ -462,6 +522,23 @@ async function decodeWithBitmap(blob: Blob, maxLongestSide: number) {
     if (!origW || !origH) {
       throw new Error('ImageBitmap decoded with zero dimensions (0x0).');
     }
+
+    if (Math.max(origW, origH) > maxLongestSide) {
+      const scale = maxLongestSide / Math.max(origW, origH);
+      const targetW = Math.max(1, Math.round(origW * scale));
+      const targetH = Math.max(1, Math.round(origH * scale));
+      try {
+        const resized = await createImageBitmap(blob, {
+          resizeWidth: targetW,
+          resizeHeight: targetH,
+          resizeQuality: 'high',
+          imageOrientation: 'from-image',
+        } as ImageBitmapOptions);
+        bitmap.close();
+        bitmap = resized;
+      } catch {}
+    }
+
     return drawDecodedSourceToWorkingCanvas(bitmap, origW, origH, maxLongestSide);
   } finally {
     if (bitmap) {
@@ -492,15 +569,146 @@ async function convertHeicBlobInMemory(heicBlob: Blob): Promise<Blob> {
   return Array.isArray(converted) ? converted[0] : converted;
 }
 
+function dataUrlToBlob(dataUrl: string): Blob {
+  const parts = dataUrl.split(',');
+  if (parts.length < 2) {
+    throw new Error('Invalid Data URL generated from canvas.');
+  }
+  const header = parts[0];
+  const base64 = parts[1];
+  const mimeMatch = header.match(/:(.*?);/);
+  const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mime });
+}
+
+export async function canvasToBlob(
+  canvas: HTMLCanvasElement | OffscreenCanvas,
+  mimeType: string,
+  quality?: number
+): Promise<Blob> {
+  const normalizedMime = normalizeOutputMimeType(mimeType);
+  const normalizedQuality =
+    normalizedMime === 'image/png'
+      ? undefined
+      : typeof quality === 'number'
+      ? Math.max(0.05, Math.min(1, quality))
+      : undefined;
+
+  if ('convertToBlob' in canvas && typeof canvas.convertToBlob === 'function') {
+    try {
+      const blob = await canvas.convertToBlob({
+        type: normalizedMime,
+        quality: normalizedQuality,
+      });
+      if (blob && blob.size > 0) return blob;
+    } catch (err) {
+      if (!('toDataURL' in canvas)) throw err;
+    }
+  }
+
+  if ('toBlob' in canvas && typeof canvas.toBlob === 'function') {
+    const blob = await new Promise<Blob | null>((resolve) => {
+      try {
+        canvas.toBlob(
+          (b) => resolve(b),
+          normalizedMime,
+          normalizedQuality
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+    if (blob && blob.size > 0) {
+      return blob;
+    }
+  }
+
+  // Fallback if toBlob returns null (e.g. certain palette/alpha PNGs or mobile WebViews)
+  if ('toDataURL' in canvas && typeof canvas.toDataURL === 'function') {
+    try {
+      const dataUrl = canvas.toDataURL(normalizedMime, normalizedQuality);
+      const fallbackBlob = dataUrlToBlob(dataUrl);
+      if (fallbackBlob.size > 0) {
+        return fallbackBlob;
+      }
+    } catch (fallbackErr) {
+      throw new ImageProcessError(
+        'Could not encode output image.',
+        `toBlob returned null and toDataURL fallback failed: ${
+          fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+        }`,
+        'encode'
+      );
+    }
+  }
+
+  throw new ImageProcessError(
+    'Could not encode output image.',
+    `Browser returned null Blob for ${normalizedMime}.`,
+    'encode'
+  );
+}
+
 /**
- * Generates previewUrl (from workingCanvas) and a small 320px thumbnailUrl once during intake.
+ * Builds a downscaled preview URL (longest side <= 1600px) from a source canvas
+ * so full-resolution images are never placed into an <img>.
+ */
+async function buildPreviewUrlFromCanvas(
+  sourceCanvas: HTMLCanvasElement,
+  mimeType: string = 'image/jpeg'
+): Promise<string> {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  const scale = Math.min(1, MAX_PREVIEW_DIMENSION / Math.max(w, h));
+  const prevW = Math.max(1, Math.round(w * scale));
+  const prevH = Math.max(1, Math.round(h * scale));
+
+  const prevCanvas = document.createElement('canvas');
+  prevCanvas.width = prevW;
+  prevCanvas.height = prevH;
+  const pCtx = prevCanvas.getContext('2d');
+  if (!pCtx) {
+    const fallbackBlob = await canvasToBlob(sourceCanvas, 'image/jpeg', 0.88);
+    return URL.createObjectURL(fallbackBlob);
+  }
+
+  // Fill white behind transparent PNGs when previewing as JPEG, or keep PNG/WebP transparency if source is PNG
+  const previewMime = mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+  if (previewMime === 'image/jpeg') {
+    pCtx.fillStyle = '#FFFFFF';
+    pCtx.fillRect(0, 0, prevW, prevH);
+  }
+
+  pCtx.imageSmoothingEnabled = true;
+  pCtx.imageSmoothingQuality = 'high';
+  pCtx.drawImage(sourceCanvas, 0, 0, prevW, prevH);
+
+  const previewBlob = await canvasToBlob(
+    prevCanvas,
+    previewMime,
+    previewMime === 'image/png' ? undefined : 0.88
+  );
+  prevCanvas.width = 0;
+  prevCanvas.height = 0;
+
+  return URL.createObjectURL(previewBlob);
+}
+
+/**
+ * Generates previewUrl (longest side max 1600px) and thumbnailUrl (longest side max 256px)
+ * once from workingCanvas during intake.
  */
 async function createPreviewAndThumbnailFromCanvas(
   workingCanvas: HTMLCanvasElement,
-  maxThumbEdge: number = 320
+  sourceMimeType: string = 'image/jpeg',
+  maxThumbEdge: number = MAX_THUMB_DIMENSION
 ): Promise<{ previewUrl: string; thumbnailUrl: string }> {
-  const previewBlob = await canvasToBlob(workingCanvas, 'image/jpeg', 0.88);
-  const previewUrl = URL.createObjectURL(previewBlob);
+  const previewUrl = await buildPreviewUrlFromCanvas(workingCanvas, sourceMimeType);
 
   const w = workingCanvas.width;
   const h = workingCanvas.height;
@@ -532,6 +740,20 @@ async function createPreviewAndThumbnailFromCanvas(
   };
 }
 
+export function releaseProcessedResultUrls(result?: ProcessedImageResult | null): void {
+  if (!result) return;
+  if (result.previewUrl && result.previewUrl !== result.url) {
+    try {
+      URL.revokeObjectURL(result.previewUrl);
+    } catch {}
+  }
+  if (result.url) {
+    try {
+      URL.revokeObjectURL(result.url);
+    } catch {}
+  }
+}
+
 /**
  * Releases all URLs and zeroes out the workingCanvas dimensions when a file is removed
  * or the tool is reset so mobile memory stays low.
@@ -551,10 +773,8 @@ export function releaseIngestedItem(
       URL.revokeObjectURL(item.previewUrl);
     } catch {}
   }
-  if (item.result?.url) {
-    try {
-      URL.revokeObjectURL(item.result.url);
-    } catch {}
+  if (item.result) {
+    releaseProcessedResultUrls(item.result);
   }
   if (item.workingCanvas) {
     try {
@@ -568,19 +788,6 @@ export function releaseIngestedItem(
  * ONE SHARED INTAKE FUNCTION: ingestFiles(fileList)
  * Every file input, drop zone, paste handler, and "Add more" button in every tool
  * (including Image to PDF) calls ONLY this function. No tool reads a File object on its own.
- *
- * Captures everything at the moment of selection:
- * 1) Copies Array.from(fileList) synchronously.
- * 2) Processes files one at a time in order:
- *    - Immediately starts createImageBitmap(file) and, in parallel, reads file.arrayBuffer()
- *      (with a 250ms auto-retry before failing as a read error).
- *    - Builds an in-memory originalBlob from the ArrayBuffer with the guessed MIME type.
- *    - If createImageBitmap failed, tries <img> with URL.createObjectURL and await img.decode(),
- *      then FileReader.readAsDataURL and await img.decode().
- *    - If the file is HEIC/HEIF and native decode fails, lazy-loads heic2any in memory.
- *    - Draws the first successful result once onto workingCanvas (longest side <= 2560px).
- * 3) Returns IngestedFileItem[] with { id, name, size, type, originalBlob, workingCanvas, width, height, ... }.
- *    Never stores the transient File reference.
  */
 export async function ingestFiles(
   fileList: FileList | File[],
@@ -624,7 +831,11 @@ export async function ingestFiles(
               return await createImageBitmap(file);
             }
           })().catch((err) => {
-            stepLogs.push(`Immediate createImageBitmap(file) failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+            stepLogs.push(
+              `Immediate createImageBitmap(file) failed: ${
+                err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+              }`
+            );
             return null;
           })
         : Promise.resolve(null);
@@ -633,7 +844,11 @@ export async function ingestFiles(
       readArrayBufferWithRetry(file, 250)
         .then((buffer) => ({ buffer }))
         .catch((err) => {
-          stepLogs.push(`arrayBuffer(file) with 250ms retry failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+          stepLogs.push(
+            `arrayBuffer(file) with 250ms retry failed: ${
+              err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            }`
+          );
           return { buffer: null, error: err };
         });
 
@@ -644,9 +859,8 @@ export async function ingestFiles(
 
     const buffer = bufferResult.buffer;
 
-    // If BOTH arrayBuffer read AND immediate bitmap failed, check if Android blocked access to the file handle
+    // If BOTH arrayBuffer read AND immediate bitmap failed, Android blocked access to the file handle
     if (!buffer && !immediateBitmap) {
-      console.error('[ingestFiles] Read failure on file:', fileName, bufferResult.error);
       results.push({
         id,
         name: fileName,
@@ -666,7 +880,8 @@ export async function ingestFiles(
           name: fileName,
           type: declaredType,
           size: declaredSize,
-          stage: 'read (file.arrayBuffer + 250ms retry)',
+          dimensions: '0 × 0 px',
+          stage: 'read',
           extra: stepLogs.join(' | '),
         }),
       });
@@ -691,8 +906,6 @@ export async function ingestFiles(
       originalHeight: number;
     } | null = null;
 
-    let canvasBlockedError: ImageProcessError | null = null;
-
     // 1. If immediate createImageBitmap(file) succeeded, draw it once onto workingCanvas
     if (immediateBitmap) {
       try {
@@ -701,17 +914,46 @@ export async function ingestFiles(
         if (!origW || !origH) {
           throw new Error('Immediate ImageBitmap had 0x0 dimensions.');
         }
-        drawn = drawDecodedSourceToWorkingCanvas(
-          immediateBitmap,
-          origW,
-          origH,
-          MAX_WORKING_DIMENSION
-        );
-      } catch (err) {
-        if (err instanceof ImageProcessError && err.stage === 'canvas') {
-          canvasBlockedError = err;
+
+        // If large camera photo (>2560px) and originalBlob is ready, try resize options with imageOrientation: 'from-image'
+        if (Math.max(origW, origH) > MAX_WORKING_DIMENSION && originalBlob) {
+          const scale = MAX_WORKING_DIMENSION / Math.max(origW, origH);
+          const targetW = Math.max(1, Math.round(origW * scale));
+          const targetH = Math.max(1, Math.round(origH * scale));
+          try {
+            const resizedBmp = await createImageBitmap(originalBlob, {
+              resizeWidth: targetW,
+              resizeHeight: targetH,
+              resizeQuality: 'high',
+              imageOrientation: 'from-image',
+            } as ImageBitmapOptions);
+            try {
+              drawn = drawDecodedSourceToWorkingCanvas(
+                resizedBmp,
+                origW,
+                origH,
+                MAX_WORKING_DIMENSION
+              );
+            } finally {
+              resizedBmp.close();
+            }
+          } catch {}
         }
-        stepLogs.push(`Draw from immediate ImageBitmap failed: ${err instanceof Error ? err.message : String(err)}`);
+
+        if (!drawn) {
+          drawn = drawDecodedSourceToWorkingCanvas(
+            immediateBitmap,
+            origW,
+            origH,
+            MAX_WORKING_DIMENSION
+          );
+        }
+      } catch (err) {
+        stepLogs.push(
+          `Draw from immediate ImageBitmap failed: ${
+            err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+          }`
+        );
       } finally {
         try {
           immediateBitmap.close();
@@ -736,95 +978,62 @@ export async function ingestFiles(
     // 2. Fallback chain using the in-memory originalBlob (or file if blob wasn't built)
     const decodeSourceBlob: Blob = originalBlob || file;
 
-    if (!drawn && !canvasBlockedError) {
-      // Try <img> with URL.createObjectURL and await img.decode()
+    if (!drawn) {
       try {
         drawn = await decodeWithObjectUrl(decodeSourceBlob, MAX_WORKING_DIMENSION);
       } catch (err) {
-        if (err instanceof ImageProcessError && err.stage === 'canvas') {
-          canvasBlockedError = err;
-        } else {
-          stepLogs.push(`URL.createObjectURL + img.decode failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
-          console.error('[ingestFiles] objectURL decode failed:', err);
-        }
+        stepLogs.push(
+          `URL.createObjectURL + img.decode failed: ${
+            err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+          }`
+        );
       }
     }
 
-    if (!drawn && !canvasBlockedError) {
-      // Try FileReader.readAsDataURL and decode that
+    if (!drawn) {
       try {
         drawn = await decodeWithDataUrl(decodeSourceBlob, MAX_WORKING_DIMENSION);
       } catch (err) {
-        if (err instanceof ImageProcessError && err.stage === 'canvas') {
-          canvasBlockedError = err;
-        } else {
-          stepLogs.push(`FileReader.readAsDataURL + img.decode failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
-          console.error('[ingestFiles] dataURL decode failed:', err);
-        }
+        stepLogs.push(
+          `FileReader.readAsDataURL + img.decode failed: ${
+            err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+          }`
+        );
       }
     }
 
-    if (!drawn && !canvasBlockedError && originalBlob) {
-      // Try createImageBitmap on the in-memory originalBlob with normalized MIME type
+    if (!drawn && originalBlob) {
       try {
         drawn = await decodeWithBitmap(originalBlob, MAX_WORKING_DIMENSION);
       } catch (err) {
-        if (err instanceof ImageProcessError && err.stage === 'canvas') {
-          canvasBlockedError = err;
-        } else {
-          stepLogs.push(`createImageBitmap(originalBlob) failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
-        }
+        stepLogs.push(
+          `createImageBitmap(originalBlob) failed: ${
+            err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+          }`
+        );
       }
     }
 
     // 3. If the file is HEIC/HEIF and the browser could not decode it natively, lazy-load heic2any
     let heicConversionFailed = false;
-    if (!drawn && !canvasBlockedError && isHeic && originalBlob) {
+    if (!drawn && isHeic && originalBlob) {
       try {
         const convertedJpgBlob = await convertHeicBlobInMemory(originalBlob);
         originalBlob = convertedJpgBlob;
         drawn = await decodeWithObjectUrl(convertedJpgBlob, MAX_WORKING_DIMENSION);
       } catch (heicErr) {
-        if (heicErr instanceof ImageProcessError && heicErr.stage === 'canvas') {
-          canvasBlockedError = heicErr;
-        } else {
-          heicConversionFailed = true;
-          stepLogs.push(`heic2any conversion failed: ${heicErr instanceof Error ? `${heicErr.name}: ${heicErr.message}` : String(heicErr)}`);
-          console.error('[ingestFiles] heic2any fallback failed:', heicErr);
-        }
+        heicConversionFailed = true;
+        stepLogs.push(
+          `heic2any conversion failed: ${
+            heicErr instanceof Error ? `${heicErr.name}: ${heicErr.message}` : String(heicErr)
+          }`
+        );
       }
     }
 
-    if (canvasBlockedError) {
-      results.push({
-        id,
-        name: fileName,
-        size: actualSize,
-        type: mimeType,
-        originalBlob: null,
-        workingCanvas: null,
-        width: 0,
-        height: 0,
-        originalWidth: 0,
-        originalHeight: 0,
-        previewUrl: '',
-        thumbnailUrl: '',
-        warning,
-        error: ERROR_MSG_CANVAS_BLOCKED,
-        errorStage: 'canvas',
-        errorDetails: buildDiagnosticDetails(canvasBlockedError, {
-          name: fileName,
-          type: mimeType,
-          size: actualSize,
-          stage: 'canvas (Brave Shields / fingerprint check)',
-          extra: stepLogs.join(' | '),
-        }),
-      });
-      continue;
-    }
-
     if (!drawn) {
-      const friendlyMsg = isHeic || heicConversionFailed ? ERROR_MSG_HEIC_FAILED : ERROR_MSG_UNSUPPORTED_FORMAT;
+      const friendlyMsg =
+        isHeic || heicConversionFailed ? ERROR_MSG_HEIC_FAILED : ERROR_MSG_UNSUPPORTED_FORMAT;
       results.push({
         id,
         name: fileName,
@@ -845,18 +1054,23 @@ export async function ingestFiles(
           name: fileName,
           type: mimeType,
           size: actualSize,
-          stage: isHeic ? 'decode (HEIC/HEIF)' : 'decode (all decoders failed)',
+          dimensions: '0 × 0 px',
+          stage: 'decode',
           extra: stepLogs.join(' | '),
         }),
       });
       continue;
     }
 
-    // Create preview & thumbnail URLs once from the in-memory workingCanvas
+    // Create downscaled previewUrl (max 1600px) & thumbnailUrl (max 256px) once from workingCanvas
     let previewUrl = '';
     let thumbnailUrl = '';
     try {
-      const urls = await createPreviewAndThumbnailFromCanvas(drawn.canvas);
+      const urls = await createPreviewAndThumbnailFromCanvas(
+        drawn.canvas,
+        isHeic ? 'image/jpeg' : mimeType,
+        MAX_THUMB_DIMENSION
+      );
       previewUrl = urls.previewUrl;
       thumbnailUrl = urls.thumbnailUrl;
     } catch (thumbErr) {
@@ -886,7 +1100,6 @@ export async function ingestFiles(
 /**
  * Ensures we have a live workingCanvas for an IngestedFileItem.
  * Uses item.workingCanvas directly; if it was ever released, re-decodes from item.originalBlob in memory.
- * Never touches a File object.
  */
 async function ensureWorkingCanvas(
   item: IngestedFileItem
@@ -928,46 +1141,8 @@ async function ensureWorkingCanvas(
   throw new ImageProcessError(
     ERROR_MSG_READ_BLOCKED,
     'MissingInMemoryData: Neither workingCanvas nor originalBlob is available in memory.',
-    'process'
+    'read'
   );
-}
-
-export function canvasToBlob(
-  canvas: HTMLCanvasElement | OffscreenCanvas,
-  mimeType: string,
-  quality?: number
-): Promise<Blob> {
-  const normalizedQuality =
-    mimeType === 'image/png'
-      ? undefined
-      : typeof quality === 'number'
-      ? Math.max(0.05, Math.min(1, quality))
-      : undefined;
-
-  if ('convertToBlob' in canvas && typeof canvas.convertToBlob === 'function') {
-    return canvas.convertToBlob({
-      type: mimeType,
-      quality: normalizedQuality,
-    });
-  }
-
-  return new Promise((resolve, reject) => {
-    try {
-      (canvas as HTMLCanvasElement).toBlob(
-        (blob) => {
-          if (!blob) {
-            reject(new Error(`EncodingError: Browser returned null Blob for ${mimeType}.`));
-            return;
-          }
-          resolve(blob);
-        },
-        mimeType,
-        normalizedQuality
-      );
-    } catch (err) {
-      reject(err);
-    }
-  });
 }
 
 export function getOutputFilename(
@@ -976,16 +1151,18 @@ export function getOutputFilename(
   targetMimeType: string
 ): string {
   const base = (originalName || 'image').replace(/\.[^/.]+$/, '') || 'image';
+  const normalized = normalizeOutputMimeType(targetMimeType);
   let ext = 'jpg';
-  if (targetMimeType === 'image/png') ext = 'png';
-  else if (targetMimeType === 'image/webp') ext = 'webp';
-  else if (targetMimeType === 'application/pdf') ext = 'pdf';
+  if (normalized === 'image/png') ext = 'png';
+  else if (normalized === 'image/webp') ext = 'webp';
+  else if (normalized === 'application/pdf') ext = 'pdf';
   return `${base}${suffix ? `-${suffix}` : ''}.${ext}`;
 }
 
 /**
  * Web Worker script that ONLY receives already-decoded, downscaled pixels (ImageData buffer)
- * and runs the encode loop on OffscreenCanvas. Never touches File objects.
+ * and runs the encode loop on OffscreenCanvas.
+ * When encoding to JPEG, composites any transparent pixels over solid white (#FFFFFF).
  */
 const WORKER_ENCODE_SCRIPT = `
 self.onmessage = async (event) => {
@@ -996,6 +1173,19 @@ self.onmessage = async (event) => {
     }
 
     const clamped = new Uint8ClampedArray(pixelsBuffer);
+    if (mimeType === 'image/jpeg' || mode === 'encodeTargetKB') {
+      for (let i = 0; i < clamped.length; i += 4) {
+        const a = clamped[i + 3];
+        if (a < 255) {
+          const alpha = a / 255;
+          clamped[i] = Math.round(clamped[i] * alpha + 255 * (1 - alpha));
+          clamped[i + 1] = Math.round(clamped[i + 1] * alpha + 255 * (1 - alpha));
+          clamped[i + 2] = Math.round(clamped[i + 2] * alpha + 255 * (1 - alpha));
+          clamped[i + 3] = 255;
+        }
+      }
+    }
+
     const imgData = new ImageData(clamped, width, height);
     const baseCanvas = new OffscreenCanvas(width, height);
     const baseCtx = baseCanvas.getContext('2d');
@@ -1014,6 +1204,7 @@ self.onmessage = async (event) => {
         width,
         height,
         mimeType,
+        qualityUsed: mimeType === 'image/png' ? null : Math.round((q ?? 0.9) * 100),
       });
       return;
     }
@@ -1024,6 +1215,7 @@ self.onmessage = async (event) => {
       let bestBlob = null;
       let bestW = curW;
       let bestH = curH;
+      let bestQuality = 75;
 
       for (let round = 0; round < 4; round++) {
         let roundCanvas = baseCanvas;
@@ -1057,12 +1249,14 @@ self.onmessage = async (event) => {
             bestBlob = testBlob;
             bestW = curW;
             bestH = curH;
+            bestQuality = Math.round(mid * 100);
             self.postMessage({
               jobId,
               status: 'candidate',
               blob: bestBlob,
               width: bestW,
               height: bestH,
+              qualityUsed: bestQuality,
               mimeType: 'image/jpeg',
             });
           }
@@ -1071,6 +1265,7 @@ self.onmessage = async (event) => {
             bestBlob = testBlob;
             bestW = curW;
             bestH = curH;
+            bestQuality = Math.round(mid * 100);
             hit90To100 = true;
             break;
           }
@@ -1105,6 +1300,7 @@ self.onmessage = async (event) => {
           bestBlob = finalBlob;
           bestW = finalW;
           bestH = finalH;
+          bestQuality = 50;
         }
       }
 
@@ -1114,6 +1310,7 @@ self.onmessage = async (event) => {
         blob: bestBlob,
         width: bestW,
         height: bestH,
+        qualityUsed: bestQuality,
         mimeType: 'image/jpeg',
       });
       return;
@@ -1168,10 +1365,58 @@ export function resetImageWorker(): void {
   }
 }
 
+async function buildProcessedResult(params: {
+  blob: Blob;
+  sourceCanvas: HTMLCanvasElement;
+  originalBytes: number;
+  width: number;
+  height: number;
+  qualityUsed: number | null;
+  jobId: number;
+  filename: string;
+  mimeType: string;
+  timedOut?: boolean;
+  timeoutMessage?: string;
+}): Promise<ProcessedImageResult> {
+  const normalizedMime = normalizeOutputMimeType(params.mimeType);
+  const url = URL.createObjectURL(params.blob);
+
+  // Never put >1600px images in an <img>: if the output is larger than 1600px on its longest side,
+  // build a downscaled previewUrl (longest side max 1600px) from the output canvas.
+  let previewUrl = url;
+  if (
+    normalizedMime !== 'application/pdf' &&
+    Math.max(params.width, params.height) > MAX_PREVIEW_DIMENSION
+  ) {
+    try {
+      previewUrl = await buildPreviewUrlFromCanvas(params.sourceCanvas, normalizedMime);
+    } catch {
+      previewUrl = url;
+    }
+  }
+
+  return {
+    blob: params.blob,
+    url,
+    previewUrl,
+    originalBytes: params.originalBytes,
+    newBytes: params.blob.size,
+    sizeBytes: params.blob.size,
+    qualityUsed: normalizedMime === 'image/png' ? null : params.qualityUsed,
+    format: mimeToFormatLabel(normalizedMime),
+    width: params.width,
+    height: params.height,
+    jobId: params.jobId,
+    filename: params.filename,
+    mimeType: normalizedMime,
+    timedOut: params.timedOut,
+    timeoutMessage: params.timeoutMessage,
+  };
+}
+
 /**
  * Transfers ONLY the downscaled ImageData pixels from a main-thread canvas to the Web Worker
- * for encoding. If the worker fails to start or throws for any reason (or forceMainThread is true),
- * automatically falls back to encoding on the main thread in small async steps.
+ * for encoding. If the worker fails or forceMainThread is true, falls back to the main thread.
  */
 async function encodeCanvasWithWorkerOrFallback(
   canvas: HTMLCanvasElement,
@@ -1179,25 +1424,32 @@ async function encodeCanvasWithWorkerOrFallback(
   mimeType: string,
   quality: number | undefined,
   filename: string,
+  originalBytes: number,
+  callerJobId: number = 0,
   forceMainThread: boolean = false
 ): Promise<ProcessedImageResult> {
   const width = canvas.width;
   const height = canvas.height;
-
-  verifyCanvasNotBlocked(canvas, ctx);
+  const normalizedMime = normalizeOutputMimeType(mimeType);
+  const qualityPercent =
+    normalizedMime === 'image/png'
+      ? null
+      : Math.round((typeof quality === 'number' ? quality : 0.9) * 100);
 
   const mainThreadEncode = async (): Promise<ProcessedImageResult> => {
     await waitNextFrame();
-    const blob = await canvasToBlob(canvas, mimeType, quality);
-    return {
+    const blob = await canvasToBlob(canvas, normalizedMime, quality);
+    return buildProcessedResult({
       blob,
-      url: URL.createObjectURL(blob),
+      sourceCanvas: canvas,
+      originalBytes,
       width,
       height,
-      sizeBytes: blob.size,
+      qualityUsed: qualityPercent,
+      jobId: callerJobId,
       filename,
-      mimeType,
-    };
+      mimeType: normalizedMime,
+    });
   };
 
   if (forceMainThread) {
@@ -1214,11 +1466,11 @@ async function encodeCanvasWithWorkerOrFallback(
     const imgData = ctx.getImageData(0, 0, width, height);
     pixelsBuffer = imgData.data.buffer.slice(0);
   } catch (err) {
-    console.error('[worker]', 'Could not extract ImageData for worker transfer, using main thread', err);
+    console.warn('[worker]', 'Could not extract ImageData for worker transfer, using main thread', err);
     return mainThreadEncode();
   }
 
-  const jobId = ++workerJobSeq;
+  const workerSeqId = ++workerJobSeq;
 
   return new Promise<ProcessedImageResult>((resolve, reject) => {
     let settled = false;
@@ -1238,36 +1490,38 @@ async function encodeCanvasWithWorkerOrFallback(
 
     const onMessage = (e: MessageEvent) => {
       const data = e.data;
-      if (!data || data.jobId !== jobId || settled) return;
+      if (!data || data.jobId !== workerSeqId || settled) return;
 
       if (data.status === 'done' && data.blob) {
         settled = true;
         cleanup();
-        resolve({
+        buildProcessedResult({
           blob: data.blob,
-          url: URL.createObjectURL(data.blob),
+          sourceCanvas: canvas,
+          originalBytes,
           width: data.width,
           height: data.height,
-          sizeBytes: data.blob.size,
+          qualityUsed: data.qualityUsed ?? qualityPercent,
+          jobId: callerJobId,
           filename,
-          mimeType: data.mimeType,
-        });
+          mimeType: data.mimeType || normalizedMime,
+        })
+          .then(resolve)
+          .catch(reject);
         return;
       }
 
       if (data.status === 'error') {
         settled = true;
         cleanup();
-        console.error('[worker]', 'Worker encode error, running main-thread fallback:', data.error);
         mainThreadEncode().then(resolve).catch(reject);
       }
     };
 
-    const onError = (err: ErrorEvent) => {
+    const onError = () => {
       if (settled) return;
       settled = true;
       cleanup();
-      console.error('[worker]', 'Worker error event, running main-thread fallback:', err);
       resetImageWorker();
       mainThreadEncode().then(resolve).catch(reject);
     };
@@ -1278,20 +1532,19 @@ async function encodeCanvasWithWorkerOrFallback(
     try {
       worker.postMessage(
         {
-          jobId,
+          jobId: workerSeqId,
           mode: 'encodeSingle',
           width,
           height,
           pixelsBuffer,
-          mimeType,
+          mimeType: normalizedMime,
           quality: quality ?? 0.9,
         },
         [pixelsBuffer]
       );
-    } catch (postErr) {
+    } catch {
       settled = true;
       cleanup();
-      console.error('[worker]', 'postMessage failed, running main-thread fallback:', postErr);
       mainThreadEncode().then(resolve).catch(reject);
     }
   });
@@ -1304,13 +1557,18 @@ export async function compressOrConvertImage(
     outputMimeType: 'image/jpeg' | 'image/png' | 'image/webp';
     backgroundColor?: string;
     suffix?: string;
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
+  const normalizedMime = normalizeOutputMimeType(options.outputMimeType) as
+    | 'image/jpeg'
+    | 'image/png'
+    | 'image/webp';
   const filename = getOutputFilename(
     item.name,
     options.suffix ?? 'optimized',
-    options.outputMimeType
+    normalizedMime
   );
 
   const loaded = await ensureWorkingCanvas(item);
@@ -1324,44 +1582,35 @@ export async function compressOrConvertImage(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not create working 2D context.',
-      'canvas'
+      'process'
     );
   }
 
-  if (options.outputMimeType === 'image/jpeg') {
+  // Always fill with white (or chosen backgroundColor) when output is JPG so transparent PNGs never turn black
+  if (normalizedMime === 'image/jpeg') {
     workCtx.fillStyle = options.backgroundColor || '#FFFFFF';
     workCtx.fillRect(0, 0, width, height);
+  } else {
+    workCtx.clearRect(0, 0, width, height);
   }
 
   workCtx.imageSmoothingEnabled = true;
   workCtx.imageSmoothingQuality = 'high';
   workCtx.drawImage(loaded.canvas, 0, 0, width, height);
 
-  if (options.outputMimeType === 'image/png' && options.quality < 95) {
-    await waitNextFrame();
-    const levels = Math.max(8, Math.round((options.quality / 100) * 64));
-    const step = 255 / (levels - 1);
-    const imgData = workCtx.getImageData(0, 0, width, height);
-    const d = imgData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      d[i] = Math.round(Math.round(d[i] / step) * step);
-      d[i + 1] = Math.round(Math.round(d[i + 1] / step) * step);
-      d[i + 2] = Math.round(Math.round(d[i + 2] / step) * step);
-    }
-    workCtx.putImageData(imgData, 0, 0);
-  }
-
   const normalizedQuality =
-    options.outputMimeType === 'image/png'
+    normalizedMime === 'image/png'
       ? undefined
       : Math.max(0.05, Math.min(1, options.quality / 100));
 
   return encodeCanvasWithWorkerOrFallback(
     workCanvas,
     workCtx,
-    options.outputMimeType,
+    normalizedMime,
     normalizedQuality,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -1369,14 +1618,13 @@ export async function compressOrConvertImage(
 export async function compressToTargetKB(
   item: IngestedFileItem,
   targetKB: number,
-  forceMainThread: boolean = false
+  forceMainThread: boolean = false,
+  callerJobId: number = 0
 ): Promise<ProcessedImageResult> {
   const filename = getOutputFilename(item.name, `${targetKB}kb`, 'image/jpeg');
   const targetBytes = targetKB * 1024;
 
-  // Estimate needed pixel dimensions from target bytes: sqrt(targetBytes * 40) on the long side
   const estimatedLongSide = Math.max(120, Math.round(Math.sqrt(targetBytes * 40)));
-
   const loaded = await ensureWorkingCanvas(item);
 
   const scale = Math.min(1, estimatedLongSide / Math.max(loaded.width, loaded.height));
@@ -1391,7 +1639,7 @@ export async function compressToTargetKB(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not initialize target-KB working canvas.',
-      'canvas'
+      'process'
     );
   }
 
@@ -1401,15 +1649,13 @@ export async function compressToTargetKB(
   startCtx.imageSmoothingQuality = 'high';
   startCtx.drawImage(loaded.canvas, 0, 0, startW, startH);
 
-  verifyCanvasNotBlocked(startCanvas, startCtx);
-
-  // Main-thread responsive async fallback loop (yields a frame between each iteration)
   const runMainThreadTargetKBLoop = async (): Promise<ProcessedImageResult> => {
     let curW = startW;
     let curH = startH;
     let bestBlob: Blob | null = null;
     let bestW = curW;
     let bestH = curH;
+    let bestQuality = 75;
     const startTime = Date.now();
 
     for (let round = 0; round < 4; round++) {
@@ -1447,28 +1693,32 @@ export async function compressToTargetKB(
           bestBlob = testBlob;
           bestW = curW;
           bestH = curH;
+          bestQuality = Math.round(mid * 100);
         }
 
         if (testBlob.size >= targetBytes * 0.9 && testBlob.size <= targetBytes) {
           bestBlob = testBlob;
           bestW = curW;
           bestH = curH;
+          bestQuality = Math.round(mid * 100);
           hit90To100 = true;
           break;
         }
 
         if (Date.now() - startTime > SAFETY_TIMEOUT_MS && bestBlob) {
-          return {
+          return buildProcessedResult({
             blob: bestBlob,
-            url: URL.createObjectURL(bestBlob),
+            sourceCanvas: startCanvas,
+            originalBytes: item.size,
             width: bestW,
             height: bestH,
-            sizeBytes: bestBlob.size,
+            qualityUsed: bestQuality,
+            jobId: callerJobId,
             filename,
             mimeType: 'image/jpeg',
             timedOut: true,
             timeoutMessage: 'Returned the best result found within 10 seconds.',
-          };
+          });
         }
 
         if (iter === 0 && testBlob.size > targetBytes) {
@@ -1504,22 +1754,26 @@ export async function compressToTargetKB(
         bestBlob = finalBlob;
         bestW = finalW;
         bestH = finalH;
+        bestQuality = 50;
       }
     }
 
     if (!bestBlob) {
       bestBlob = await canvasToBlob(startCanvas, 'image/jpeg', 0.5);
+      bestQuality = 50;
     }
 
-    return {
+    return buildProcessedResult({
       blob: bestBlob,
-      url: URL.createObjectURL(bestBlob),
+      sourceCanvas: startCanvas,
+      originalBytes: item.size,
       width: bestW,
       height: bestH,
-      sizeBytes: bestBlob.size,
+      qualityUsed: bestQuality,
+      jobId: callerJobId,
       filename,
       mimeType: 'image/jpeg',
-    };
+    });
   };
 
   if (forceMainThread) {
@@ -1535,16 +1789,16 @@ export async function compressToTargetKB(
   try {
     const imgData = startCtx.getImageData(0, 0, startW, startH);
     pixelsBuffer = imgData.data.buffer.slice(0);
-  } catch (err) {
-    console.error('[worker]', 'Could not get ImageData for targetKB worker, falling back to main thread', err);
+  } catch {
     return runMainThreadTargetKBLoop();
   }
 
-  const jobId = ++workerJobSeq;
+  const workerSeqId = ++workerJobSeq;
 
   return new Promise<ProcessedImageResult>((resolve, reject) => {
     let settled = false;
-    let latestCandidate: { blob: Blob; width: number; height: number } | null = null;
+    let latestCandidate: { blob: Blob; width: number; height: number; qualityUsed: number } | null =
+      null;
 
     const timeoutId = setTimeout(() => {
       if (settled) return;
@@ -1552,17 +1806,21 @@ export async function compressToTargetKB(
       cleanup();
       resetImageWorker();
       if (latestCandidate) {
-        resolve({
+        buildProcessedResult({
           blob: latestCandidate.blob,
-          url: URL.createObjectURL(latestCandidate.blob),
+          sourceCanvas: startCanvas,
+          originalBytes: item.size,
           width: latestCandidate.width,
           height: latestCandidate.height,
-          sizeBytes: latestCandidate.blob.size,
+          qualityUsed: latestCandidate.qualityUsed,
+          jobId: callerJobId,
           filename,
           mimeType: 'image/jpeg',
           timedOut: true,
           timeoutMessage: 'Returned the best result found within 10 seconds.',
-        });
+        })
+          .then(resolve)
+          .catch(reject);
       } else {
         runMainThreadTargetKBLoop().then(resolve).catch(reject);
       }
@@ -1576,13 +1834,14 @@ export async function compressToTargetKB(
 
     const onMessage = (e: MessageEvent) => {
       const data = e.data;
-      if (!data || data.jobId !== jobId || settled) return;
+      if (!data || data.jobId !== workerSeqId || settled) return;
 
       if (data.status === 'candidate' && data.blob) {
         latestCandidate = {
           blob: data.blob,
           width: data.width,
           height: data.height,
+          qualityUsed: data.qualityUsed ?? 75,
         };
         return;
       }
@@ -1590,31 +1849,33 @@ export async function compressToTargetKB(
       if (data.status === 'done' && data.blob) {
         settled = true;
         cleanup();
-        resolve({
+        buildProcessedResult({
           blob: data.blob,
-          url: URL.createObjectURL(data.blob),
+          sourceCanvas: startCanvas,
+          originalBytes: item.size,
           width: data.width,
           height: data.height,
-          sizeBytes: data.blob.size,
+          qualityUsed: data.qualityUsed ?? 75,
+          jobId: callerJobId,
           filename,
           mimeType: 'image/jpeg',
-        });
+        })
+          .then(resolve)
+          .catch(reject);
         return;
       }
 
       if (data.status === 'error') {
         settled = true;
         cleanup();
-        console.error('[worker]', 'Worker targetKB error, falling back to main thread:', data.error);
         runMainThreadTargetKBLoop().then(resolve).catch(reject);
       }
     };
 
-    const onError = (err: ErrorEvent) => {
+    const onError = () => {
       if (settled) return;
       settled = true;
       cleanup();
-      console.error('[worker]', 'Worker error during targetKB, falling back to main thread:', err);
       resetImageWorker();
       runMainThreadTargetKBLoop().then(resolve).catch(reject);
     };
@@ -1625,7 +1886,7 @@ export async function compressToTargetKB(
     try {
       worker.postMessage(
         {
-          jobId,
+          jobId: workerSeqId,
           mode: 'encodeTargetKB',
           width: startW,
           height: startH,
@@ -1634,10 +1895,9 @@ export async function compressToTargetKB(
         },
         [pixelsBuffer]
       );
-    } catch (postErr) {
+    } catch {
       settled = true;
       cleanup();
-      console.error('[worker]', 'postMessage failed for targetKB, falling back to main thread:', postErr);
       runMainThreadTargetKBLoop().then(resolve).catch(reject);
     }
   });
@@ -1650,12 +1910,17 @@ export async function resizeImageFile(
     height: number;
     quality: number;
     outputMimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
   const w = Math.max(1, Math.min(4096, Math.round(options.width)));
   const h = Math.max(1, Math.min(4096, Math.round(options.height)));
-  const filename = getOutputFilename(item.name, `${w}x${h}`, options.outputMimeType);
+  const normalizedMime = normalizeOutputMimeType(options.outputMimeType) as
+    | 'image/jpeg'
+    | 'image/png'
+    | 'image/webp';
+  const filename = getOutputFilename(item.name, `${w}x${h}`, normalizedMime);
 
   const loaded = await ensureWorkingCanvas(item);
 
@@ -1667,26 +1932,30 @@ export async function resizeImageFile(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not initialize resize canvas.',
-      'canvas'
+      'process'
     );
   }
 
-  if (options.outputMimeType === 'image/jpeg') {
+  if (normalizedMime === 'image/jpeg') {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, w, h);
+  } else {
+    ctx.clearRect(0, 0, w, h);
   }
 
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(loaded.canvas, 0, 0, w, h);
 
-  const q = options.outputMimeType === 'image/png' ? undefined : options.quality / 100;
+  const q = normalizedMime === 'image/png' ? undefined : options.quality / 100;
   return encodeCanvasWithWorkerOrFallback(
     canvas,
     ctx,
-    options.outputMimeType,
+    normalizedMime,
     q,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -1695,9 +1964,14 @@ export async function cropImageFile(
   item: IngestedFileItem,
   cropNorm: { x: number; y: number; width: number; height: number },
   outputMimeType: 'image/jpeg' | 'image/png' | 'image/webp' = 'image/jpeg',
-  forceMainThread: boolean = false
+  forceMainThread: boolean = false,
+  callerJobId: number = 0
 ): Promise<ProcessedImageResult> {
-  const filename = getOutputFilename(item.name, 'cropped', outputMimeType);
+  const normalizedMime = normalizeOutputMimeType(outputMimeType) as
+    | 'image/jpeg'
+    | 'image/png'
+    | 'image/webp';
+  const filename = getOutputFilename(item.name, 'cropped', normalizedMime);
   const loaded = await ensureWorkingCanvas(item);
 
   const sx = Math.max(0, Math.round(cropNorm.x * loaded.width));
@@ -1713,13 +1987,15 @@ export async function cropImageFile(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not initialize crop canvas.',
-      'canvas'
+      'process'
     );
   }
 
-  if (outputMimeType === 'image/jpeg') {
+  if (normalizedMime === 'image/jpeg') {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, sw, sh);
+  } else {
+    ctx.clearRect(0, 0, sw, sh);
   }
 
   ctx.imageSmoothingEnabled = true;
@@ -1729,9 +2005,11 @@ export async function cropImageFile(
   return encodeCanvasWithWorkerOrFallback(
     canvas,
     ctx,
-    outputMimeType,
-    0.92,
+    normalizedMime,
+    normalizedMime === 'image/png' ? undefined : 0.92,
     filename,
+    item.size,
+    callerJobId,
     forceMainThread
   );
 }
@@ -1745,6 +2023,7 @@ export async function generatePassportPhoto(
     panY: number;
     brightenBackground: boolean;
     outputLayout: 'single' | 'a4-sheet';
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
@@ -1775,7 +2054,7 @@ export async function generatePassportPhoto(
     throw new ImageProcessError(
       ERROR_MSG_CANVAS_BLOCKED,
       'CanvasContextError: Could not initialize passport photo canvas.',
-      'canvas'
+      'process'
     );
   }
 
@@ -1835,11 +2114,13 @@ export async function generatePassportPhoto(
       'image/jpeg',
       0.94,
       filename,
+      item.size,
+      options.jobId ?? 0,
       options.forceMainThread
     );
   }
 
-  const a4W = 1654; // 200 DPI A4 sheet for fast, crisp printing and low memory footprint
+  const a4W = 1654;
   const a4H = 2339;
   const sheetCanvas = document.createElement('canvas');
   sheetCanvas.width = a4W;
@@ -1876,6 +2157,8 @@ export async function generatePassportPhoto(
     'image/jpeg',
     0.92,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -1887,6 +2170,7 @@ export async function rotateFlipImageFile(
     straightenAngle: number;
     flipH: boolean;
     flipV: boolean;
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
@@ -1912,6 +2196,8 @@ export async function rotateFlipImageFile(
   if (outMime === 'image/jpeg') {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, w, h);
+  } else {
+    ctx.clearRect(0, 0, w, h);
   }
 
   ctx.save();
@@ -1928,6 +2214,8 @@ export async function rotateFlipImageFile(
     outMime,
     outMime === 'image/png' ? undefined : 0.92,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -1940,6 +2228,7 @@ export async function addWatermarkToImage(
     fontSizePercent: number;
     color: string;
     position: WatermarkPosition;
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
@@ -1963,6 +2252,8 @@ export async function addWatermarkToImage(
   if (outMime === 'image/jpeg') {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, w, h);
+  } else {
+    ctx.clearRect(0, 0, w, h);
   }
   ctx.drawImage(loaded.canvas, 0, 0, w, h);
 
@@ -2024,6 +2315,8 @@ export async function addWatermarkToImage(
     outMime,
     outMime === 'image/png' ? undefined : 0.92,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -2034,6 +2327,7 @@ export async function convertToBlackAndWhite(
     preset: 'standard' | 'high-contrast' | 'soft' | 'sepia';
     contrast: number;
     brightness: number;
+    jobId?: number;
     forceMainThread?: boolean;
   }
 ): Promise<ProcessedImageResult> {
@@ -2057,6 +2351,8 @@ export async function convertToBlackAndWhite(
   if (outMime === 'image/jpeg') {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, w, h);
+  } else {
+    ctx.clearRect(0, 0, w, h);
   }
   ctx.drawImage(loaded.canvas, 0, 0, w, h);
 
@@ -2096,6 +2392,8 @@ export async function convertToBlackAndWhite(
     outMime,
     outMime === 'image/png' ? undefined : 0.9,
     filename,
+    item.size,
+    options.jobId ?? 0,
     options.forceMainThread
   );
 }
@@ -2111,6 +2409,7 @@ export async function buildPdfFromImages(
     orientation: 'portrait' | 'landscape';
     marginPt: number;
     quality: number;
+    jobId?: number;
     forceMainThread?: boolean;
   },
   onProgress?: (current: number, total: number) => void,
@@ -2118,6 +2417,7 @@ export async function buildPdfFromImages(
 ): Promise<ProcessedImageResult> {
   const { PDFDocument } = await import('pdf-lib');
   const pdfDoc = await PDFDocument.create();
+  let totalOriginalBytes = 0;
 
   for (let i = 0; i < items.length; i++) {
     if (isCancelled?.()) {
@@ -2125,6 +2425,7 @@ export async function buildPdfFromImages(
     }
     onProgress?.(i + 1, items.length);
     const item = items[i];
+    totalOriginalBytes += item.size;
 
     const loaded = await ensureWorkingCanvas(item);
     const maxPageSide = 1600;
@@ -2148,13 +2449,15 @@ export async function buildPdfFromImages(
       'image/jpeg',
       options.quality / 100,
       'page.jpg',
+      item.size,
+      options.jobId ?? 0,
       options.forceMainThread
     );
 
     pageCanvas.width = 0;
     pageCanvas.height = 0;
 
-    URL.revokeObjectURL(encodedPage.url);
+    releaseProcessedResultUrls(encodedPage);
     const jpgBytes = await encodedPage.blob.arrayBuffer();
     const embeddedJpg = await pdfDoc.embedJpg(jpgBytes);
 
@@ -2195,12 +2498,19 @@ export async function buildPdfFromImages(
   const pdfBytes = await pdfDoc.save();
   const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' });
   const firstBase = items[0]?.name || 'document.jpg';
+  const url = URL.createObjectURL(blob);
   return {
     blob,
-    url: URL.createObjectURL(blob),
+    url,
+    previewUrl: url,
+    originalBytes: totalOriginalBytes,
+    newBytes: blob.size,
+    sizeBytes: blob.size,
+    qualityUsed: options.quality,
+    format: 'PDF',
     width: items.length,
     height: 1,
-    sizeBytes: blob.size,
+    jobId: options.jobId ?? 0,
     filename: getOutputFilename(
       firstBase,
       items.length > 1 ? `merged-${items.length}p` : 'document',

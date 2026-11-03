@@ -21,14 +21,11 @@ export interface CompareProps {
 }
 
 /**
- * Compare component adapted from Aceternity UI Compare:
- * - Keeps slider logic and clip-path inset(0 ${100 - sliderXPercent}% 0 0)
- * - Uses a 1.5px vermilion (#E5542B) divider line and a 44px touch handle hit area
- * - Uses slideMode="drag" with pointer events and touch-action: pan-y so vertical scroll works on phones
- * - Responsive w-full, aspect-ratio from image dimensions, object-contain (never crops photos)
- * - Corner labels "Before" and "After"
- * - Keyboard accessible handle: focusable, ArrowLeft/ArrowRight move by 2% with aria-label and aria-valuenow
- * - Zero shimmer/gradient/sweep overlays; static neutral placeholder unmounts immediately once images load
+ * Compare component:
+ * - Zero shimmer, skeleton, gradient, or dark overlays at any stage
+ * - Reserves aspect-ratio box from known width and height before images load
+ * - Never remounts while processing; keeps the Before/previous After image visible
+ *   until the new After image finishes decoding in memory, then swaps without a blank frame
  */
 export const Compare = ({
   firstImage = "",
@@ -47,30 +44,89 @@ export const Compare = ({
 }: CompareProps) => {
   const [sliderXPercent, setSliderXPercent] = useState(initialSliderPercentage);
   const [isDragging, setIsDragging] = useState(false);
-  const [firstLoaded, setFirstLoaded] = useState(false);
-  const [secondLoaded, setSecondLoaded] = useState(false);
+  const [displayedFirstImage, setDisplayedFirstImage] = useState(firstImage);
+  const [displayedSecondImage, setDisplayedSecondImage] = useState(
+    secondImage || firstImage
+  );
   const sliderRef = useRef<HTMLDivElement>(null);
-  const firstImgRef = useRef<HTMLImageElement>(null);
-  const secondImgRef = useRef<HTMLImageElement>(null);
   const autoplayRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Pre-decode Before image when file changes so it swaps without a blank frame
   useEffect(() => {
-    const img = firstImgRef.current;
-    if (img && img.complete && img.naturalWidth > 0) {
-      setFirstLoaded(true);
-    } else {
-      setFirstLoaded(false);
+    if (!firstImage) {
+      setDisplayedFirstImage("");
+      return;
     }
+    if (!displayedFirstImage) {
+      setDisplayedFirstImage(firstImage);
+    }
+    let cancelled = false;
+    const preloader = new Image();
+    preloader.decoding = "async";
+    preloader.onload = () => {
+      if (!cancelled) {
+        setDisplayedFirstImage(firstImage);
+      }
+    };
+    preloader.onerror = () => {
+      if (!cancelled) {
+        setDisplayedFirstImage(firstImage);
+      }
+    };
+    preloader.src = firstImage;
+    if (typeof preloader.decode === "function") {
+      preloader
+        .decode()
+        .then(() => {
+          if (!cancelled) {
+            setDisplayedFirstImage(firstImage);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
   }, [firstImage]);
 
+  // Keep Before/previous After image visible until the new After image is decoded, then swap without a blank frame
   useEffect(() => {
-    const img = secondImgRef.current;
-    if (img && img.complete && img.naturalWidth > 0) {
-      setSecondLoaded(true);
-    } else {
-      setSecondLoaded(false);
+    const targetAfter = secondImage || firstImage;
+    if (!targetAfter) {
+      setDisplayedSecondImage("");
+      return;
     }
-  }, [secondImage]);
+    if (!displayedSecondImage) {
+      setDisplayedSecondImage(targetAfter);
+    }
+    let cancelled = false;
+    const preloader = new Image();
+    preloader.decoding = "async";
+    preloader.onload = () => {
+      if (!cancelled) {
+        setDisplayedSecondImage(targetAfter);
+      }
+    };
+    preloader.onerror = () => {
+      if (!cancelled) {
+        setDisplayedSecondImage(targetAfter);
+      }
+    };
+    preloader.src = targetAfter;
+    if (typeof preloader.decode === "function") {
+      preloader
+        .decode()
+        .then(() => {
+          if (!cancelled) {
+            setDisplayedSecondImage(targetAfter);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [secondImage, firstImage]);
 
   const startAutoplay = useCallback(() => {
     if (!autoplay) return;
@@ -161,9 +217,6 @@ export const Compare = ({
     }
   }, []);
 
-  const isLoading =
-    (!firstLoaded && !!firstImage) || (!secondLoaded && !!secondImage);
-
   return (
     <div
       ref={sliderRef}
@@ -187,14 +240,6 @@ export const Compare = ({
         className
       )}
     >
-      {/* Static neutral block only while images are still loading; unmounted immediately on load */}
-      {isLoading && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 z-10 rounded-[10px] bg-[#EAE8E2] dark:bg-[#1E1E1C]"
-        />
-      )}
-
       {/* Corner Labels ("Before" and "After") */}
       <span className="pointer-events-none absolute top-[12px] left-[12px] z-30 rounded-[6px] border border-[#E7E5E0]/80 dark:border-[#262624] bg-white/90 dark:bg-[#161616]/90 px-[8px] py-[2px] text-[11px] font-medium text-[#1A1A1A] dark:text-[#EDEDEA]">
         {firstLabel}
@@ -234,7 +279,7 @@ export const Compare = ({
 
       {/* First Image (Before / Original, clipped by sliderXPercent) */}
       <div className="pointer-events-none relative z-20 h-full w-full overflow-hidden">
-        {firstImage ? (
+        {displayedFirstImage ? (
           <div
             className={cn(
               "absolute inset-0 z-20 h-full w-full shrink-0 select-none overflow-hidden",
@@ -245,11 +290,8 @@ export const Compare = ({
             }}
           >
             <img
-              ref={firstImgRef}
               alt={firstLabel}
-              src={firstImage}
-              onLoad={() => setFirstLoaded(true)}
-              onError={() => setFirstLoaded(true)}
+              src={displayedFirstImage}
               className={cn(
                 "absolute inset-0 z-20 h-full w-full shrink-0 object-contain opacity-100 select-none",
                 firstImageClassName
@@ -261,17 +303,14 @@ export const Compare = ({
       </div>
 
       {/* Second Image (After / Processed full layer underneath) */}
-      {secondImage ? (
+      {displayedSecondImage ? (
         <img
-          ref={secondImgRef}
           className={cn(
             "pointer-events-none absolute inset-0 z-[19] h-full w-full object-contain opacity-100 select-none",
             secondImageClassname
           )}
           alt={secondLabel}
-          src={secondImage}
-          onLoad={() => setSecondLoaded(true)}
-          onError={() => setSecondLoaded(true)}
+          src={displayedSecondImage}
           draggable={false}
         />
       ) : null}

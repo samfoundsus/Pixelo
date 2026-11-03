@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 export interface CanvasCheckState {
   checked: boolean;
   tampered: boolean;
   brave: boolean;
-  unknownError: boolean;
+  report: string;
 }
 
 export const BRAVE_SHIELDS_MESSAGE =
@@ -16,8 +16,15 @@ export const GENERIC_CANVAS_BLOCKED_MESSAGE =
 export const BRAVE_HELP_LINE =
   'Using Brave? Turn Shields off for this site so the tools can read your photos.';
 
-let cachedState: CanvasCheckState | null = null;
-let inFlightPromise: Promise<CanvasCheckState> | null = null;
+const CHANNEL_TOLERANCE = 3;
+
+let latestCheckState: CanvasCheckState = {
+  checked: false,
+  tampered: false,
+  brave: false,
+  report: 'not-run',
+};
+
 const listeners = new Set<(state: CanvasCheckState) => void>();
 
 function notifyListeners(state: CanvasCheckState) {
@@ -76,7 +83,9 @@ const SAMPLE_POINTS: Array<{ x: number; y: number; r: number; g: number; b: numb
   { x: 40, y: 40, r: 107, g: 107, b: 102 },
 ];
 
-function drawFixedPattern(ctx: CanvasRenderingContext2D) {
+function drawFixedOpaquePattern(ctx: CanvasRenderingContext2D) {
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
   for (const rect of PATTERN_RECTS) {
     ctx.fillStyle = `rgb(${rect.r}, ${rect.g}, ${rect.b})`;
     ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
@@ -99,150 +108,183 @@ function canvasToBlobCheck(canvas: HTMLCanvasElement): Promise<Blob | null> {
   });
 }
 
+export interface TamperCheckResult {
+  tampered: boolean;
+  report: string;
+}
+
 /**
- * Draws a fixed pattern on a 64x64 canvas (solid-color rectangles with known RGB values),
- * reads it back with getImageData, and compares pixels.
- * Returns true if:
- * - any sampled pixel differs from the expected value
- * - getImageData throws
- * - toBlob returns null
- * - two consecutive reads differ from each other (random farbling noise)
+ * Runs a fresh 64x64 opaque canvas check without caching:
+ * - Draws fully opaque solid rectangles (no alpha, no gradients) on two fresh 64x64 canvases
+ * - Reads pixels with getImageData and allows a tolerance of 3 per channel
+ * - Returns tampered = true ONLY if:
+ *   (a) two consecutive reads differ from each other, or
+ *   (b) sampled pixels differ from expected RGB values by more than tolerance (3), or
+ *   (c) getImageData or toBlob throws or returns null
  */
-export async function canvasIsTampered(): Promise<boolean> {
+export async function runTamperCheckDetailed(): Promise<TamperCheckResult> {
   if (typeof document === 'undefined' || typeof window === 'undefined') {
-    return false;
+    return { tampered: false, report: 'ssr (skipped)' };
   }
 
   try {
-    const runPass = async (): Promise<{ data: Uint8ClampedArray; blobOk: boolean } | null> => {
+    const runSinglePass = async (
+      passLabel: string
+    ): Promise<{
+      data: Uint8ClampedArray | null;
+      getImageDataError?: string;
+      blobOk: boolean;
+    }> => {
       const canvas = document.createElement('canvas');
       canvas.width = 64;
       canvas.height = 64;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return null;
+      const ctx =
+        canvas.getContext('2d', { alpha: false, willReadFrequently: true }) ||
+        canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) {
+        return { data: null, getImageDataError: `${passLabel}: 2D context null`, blobOk: false };
+      }
 
-      drawFixedPattern(ctx);
+      drawFixedOpaquePattern(ctx);
 
       let imgData: ImageData;
       try {
         imgData = ctx.getImageData(0, 0, 64, 64);
-      } catch {
-        // getImageData threw -> canvas read is blocked
-        return { data: new Uint8ClampedArray(0), blobOk: false };
+      } catch (err) {
+        return {
+          data: null,
+          getImageDataError: `${passLabel} getImageData threw: ${
+            err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+          }`,
+          blobOk: false,
+        };
       }
 
       const blob = await canvasToBlobCheck(canvas);
-      if (!blob || blob.size === 0) {
-        return { data: imgData.data, blobOk: false };
-      }
-
-      return { data: imgData.data, blobOk: true };
+      const blobOk = !!(blob && blob.size > 0);
+      return { data: imgData.data, blobOk };
     };
 
-    const pass1 = await runPass();
-    const pass2 = await runPass();
+    const pass1 = await runSinglePass('pass1');
+    const pass2 = await runSinglePass('pass2');
 
-    // If 2D context couldn't be created at all (e.g. non-browser test runner), treat as unknown (not tampered)
-    if (!pass1 || !pass2) {
-      return false;
+    if (!pass1.data || !pass2.data) {
+      const errMsg = pass1.getImageDataError || pass2.getImageDataError || 'getImageData returned null';
+      const report = `tampered=true | reason=${errMsg}`;
+      latestCheckState = { ...latestCheckState, checked: true, tampered: true, report };
+      return { tampered: true, report };
     }
 
-    if (!pass1.blobOk || !pass2.blobOk || pass1.data.length === 0 || pass2.data.length === 0) {
-      return true;
+    if (!pass1.blobOk || !pass2.blobOk) {
+      const report = `tampered=true | reason=toBlob returned null or empty (pass1.blobOk=${pass1.blobOk}, pass2.blobOk=${pass2.blobOk})`;
+      latestCheckState = { ...latestCheckState, checked: true, tampered: true, report };
+      return { tampered: true, report };
     }
 
-    // Compare sampled pixels against known RGB values
-    for (const pt of SAMPLE_POINTS) {
-      const idx = (pt.y * 64 + pt.x) * 4;
-      const r1 = pass1.data[idx];
-      const g1 = pass1.data[idx + 1];
-      const b1 = pass1.data[idx + 2];
-      const a1 = pass1.data[idx + 3];
-
-      if (r1 !== pt.r || g1 !== pt.g || b1 !== pt.b || a1 !== 255) {
-        return true;
-      }
-    }
-
-    // Compare pass1 and pass2 across all bytes to catch random noise injection
-    if (pass1.data.length !== pass2.data.length) {
-      return true;
-    }
+    // (a) Check if two consecutive reads differ from each other
+    let twoReadsDiffIndex = -1;
     for (let i = 0; i < pass1.data.length; i++) {
       if (pass1.data[i] !== pass2.data[i]) {
-        return true;
+        twoReadsDiffIndex = i;
+        break;
       }
     }
 
-    return false;
-  } catch (unexpectedErr) {
-    // Requirement 6: Never block usage if the check itself throws unexpectedly:
-    // treat that as "unknown", log it, and let the tool run.
-    console.warn('[canvas-check] Unexpected error during canvas check:', unexpectedErr);
-    return false;
+    // (b) Check sampled pixels against expected values with tolerance of 3 per channel
+    const sampleSummaries: string[] = [];
+    let exceededTolerance = false;
+
+    for (const pt of SAMPLE_POINTS) {
+      const idx = (pt.y * 64 + pt.x) * 4;
+      const r = pass1.data[idx];
+      const g = pass1.data[idx + 1];
+      const b = pass1.data[idx + 2];
+      const a = pass1.data[idx + 3];
+
+      const dr = Math.abs(r - pt.r);
+      const dg = Math.abs(g - pt.g);
+      const db = Math.abs(b - pt.b);
+      const da = Math.abs(a - 255);
+
+      if (sampleSummaries.length < 4 || dr > CHANNEL_TOLERANCE || dg > CHANNEL_TOLERANCE || db > CHANNEL_TOLERANCE || da > CHANNEL_TOLERANCE) {
+        sampleSummaries.push(
+          `(${pt.x},${pt.y}) exp=[${pt.r},${pt.g},${pt.b},255] act=[${r},${g},${b},${a}]`
+        );
+      }
+
+      if (
+        dr > CHANNEL_TOLERANCE ||
+        dg > CHANNEL_TOLERANCE ||
+        db > CHANNEL_TOLERANCE ||
+        da > CHANNEL_TOLERANCE
+      ) {
+        exceededTolerance = true;
+      }
+    }
+
+    const tampered = twoReadsDiffIndex !== -1 || exceededTolerance;
+    const report = [
+      `tampered=${tampered}`,
+      `twoReadsIdentical=${twoReadsDiffIndex === -1}${
+        twoReadsDiffIndex !== -1 ? ` (diff at byte ${twoReadsDiffIndex})` : ''
+      }`,
+      `tolerance=${CHANNEL_TOLERANCE}`,
+      `toBlobOk=true`,
+      `samples: ${sampleSummaries.join('; ')}`,
+    ].join(' | ');
+
+    latestCheckState = { ...latestCheckState, checked: true, tampered, report };
+    return { tampered, report };
+  } catch (err) {
+    const report = `tampered=false (unexpected check error: ${
+      err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+    })`;
+    return { tampered: false, report };
   }
+}
+
+export async function canvasIsTampered(_forceRefresh?: boolean): Promise<boolean> {
+  const res = await runTamperCheckDetailed();
+  return res.tampered;
+}
+
+export function getLastTamperReport(): string {
+  return latestCheckState.report;
 }
 
 /**
- * Runs the Brave + Canvas tampering check once on first load, caches the result in memory,
- * and re-runs it when forceRefresh is true (e.g., when the user taps "Check again").
+ * Always runs a fresh canvas tampering check (never cached).
  */
-export async function runCanvasCheck(forceRefresh = false): Promise<CanvasCheckState> {
+export async function runCanvasCheck(_forceRefresh?: boolean): Promise<CanvasCheckState> {
   if (typeof window === 'undefined') {
-    return { checked: false, tampered: false, brave: false, unknownError: false };
+    return { checked: false, tampered: false, brave: false, report: 'ssr' };
   }
 
-  if (cachedState && !forceRefresh) {
-    return cachedState;
-  }
-
-  if (inFlightPromise && !forceRefresh) {
-    return inFlightPromise;
-  }
-
-  inFlightPromise = (async () => {
-    try {
-      const [braveResult, tamperedResult] = await Promise.all([
-        isBrave(),
-        canvasIsTampered(),
-      ]);
-      const nextState: CanvasCheckState = {
-        checked: true,
-        tampered: tamperedResult,
-        brave: braveResult,
-        unknownError: false,
-      };
-      cachedState = nextState;
-      notifyListeners(nextState);
-      return nextState;
-    } catch (err) {
-      console.warn('[canvas-check] Check failed unexpectedly, treating as unknown:', err);
-      const fallbackState: CanvasCheckState = {
-        checked: true,
-        tampered: false,
-        brave: false,
-        unknownError: true,
-      };
-      cachedState = fallbackState;
-      notifyListeners(fallbackState);
-      return fallbackState;
-    } finally {
-      inFlightPromise = null;
-    }
-  })();
-
-  return inFlightPromise;
-}
-
-export function getCachedCanvasCheck(): CanvasCheckState {
-  return (
-    cachedState || {
-      checked: false,
+  try {
+    const [braveResult, tamperDetail] = await Promise.all([
+      isBrave(),
+      runTamperCheckDetailed(),
+    ]);
+    const nextState: CanvasCheckState = {
+      checked: true,
+      tampered: tamperDetail.tampered,
+      brave: braveResult,
+      report: tamperDetail.report,
+    };
+    latestCheckState = nextState;
+    notifyListeners(nextState);
+    return nextState;
+  } catch (err) {
+    const fallbackState: CanvasCheckState = {
+      checked: true,
       tampered: false,
       brave: false,
-      unknownError: false,
-    }
-  );
+      report: `error: ${err instanceof Error ? err.message : String(err)}`,
+    };
+    latestCheckState = fallbackState;
+    notifyListeners(fallbackState);
+    return fallbackState;
+  }
 }
 
 export function getShieldsWarningMessage(brave: boolean): string {
@@ -250,11 +292,21 @@ export function getShieldsWarningMessage(brave: boolean): string {
 }
 
 /**
- * React hook to subscribe to the shared canvas check state and trigger "Check again".
+ * React hook that re-runs the canvas check on page load, on "Check again",
+ * on window focus, on visibilitychange, and on pageshow (never cached).
  */
 export function useCanvasCheck() {
-  const [state, setState] = useState<CanvasCheckState>(() => getCachedCanvasCheck());
+  const [state, setState] = useState<CanvasCheckState>(latestCheckState);
   const [isChecking, setIsChecking] = useState(false);
+
+  const checkAgain = useCallback(async () => {
+    setIsChecking(true);
+    try {
+      return await runCanvasCheck();
+    } finally {
+      setIsChecking(false);
+    }
+  }, []);
 
   useEffect(() => {
     const listener = (next: CanvasCheckState) => {
@@ -262,25 +314,31 @@ export function useCanvasCheck() {
     };
     listeners.add(listener);
 
-    if (!cachedState) {
-      void runCanvasCheck(false);
-    } else {
-      setState(cachedState);
-    }
+    void runCanvasCheck();
+
+    const onFocus = () => {
+      void runCanvasCheck();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void runCanvasCheck();
+      }
+    };
+    const onPageShow = () => {
+      void runCanvasCheck();
+    };
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pageshow', onPageShow);
 
     return () => {
       listeners.delete(listener);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pageshow', onPageShow);
     };
   }, []);
-
-  const checkAgain = async () => {
-    setIsChecking(true);
-    try {
-      return await runCanvasCheck(true);
-    } finally {
-      setIsChecking(false);
-    }
-  };
 
   return {
     ...state,
